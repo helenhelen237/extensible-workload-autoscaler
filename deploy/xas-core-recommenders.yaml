@@ -1,0 +1,89 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: xas-core-recommenders
+  namespace: xas-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: xas-core-recommenders
+rules:
+  - apiGroups: ["xas.io"]
+    resources: ["recommenderclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: xas-core-recommenders
+subjects:
+  - kind: ServiceAccount
+    name: xas-core-recommenders
+    namespace: xas-system
+roleRef:
+  kind: ClusterRole
+  name: xas-core-recommenders
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: xas.io/v1
+kind: RecommenderClass
+metadata:
+  name: linear
+spec:
+  type: Linear
+---
+apiVersion: xas.io/v1
+kind: RecommenderClass
+metadata:
+  name: threshold
+spec:
+  type: Threshold
+---
+apiVersion: xas.io/v1
+kind: RecommenderClass
+metadata:
+  name: cron
+spec:
+  type: Cron
+---
+apiVersion: xas.io/v1
+kind: RecommenderClass
+metadata:
+  name: cluster-proportional
+spec:
+  type: ClusterProportional
+---
+apiVersion: xas.io/v1
+kind: RecommenderClass
+metadata:
+  name: addon-resizer
+spec:
+  type: AddonResizer
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: xas-core-recommenders
+  namespace: xas-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: xas-core-recommenders
+  template:
+    metadata:
+      labels:
+        app: xas-core-recommenders
+    spec:
+      serviceAccountName: xas-core-recommenders
+      containers:
+        - name: recommenders
+          image: ko://github.com/gke-labs/extensible-workload-autoscaler/cmd/core-recommenders
+          args:
+            - "--server-address=xas-server.xas-system.svc.cluster.local:80"
+            - "--cluster-name=default"
+            - "--debug"
