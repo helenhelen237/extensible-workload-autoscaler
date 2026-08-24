@@ -1,0 +1,61 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sample-external-metrics
+  labels:
+    sample: external-metrics
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: external-metrics-consumer
+  namespace: sample-external-metrics
+  labels:
+    sample: external-metrics
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: external-metrics-consumer
+  template:
+    metadata:
+      labels:
+        app: external-metrics-consumer
+    spec:
+      containers:
+        - name: sample-app
+          image: xas-sample:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+---
+apiVersion: xas.io/v1
+kind: ScalingPolicy
+metadata:
+  name: external-metrics
+  namespace: sample-external-metrics
+  labels:
+    sample: external-metrics
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: external-metrics-consumer
+  minReplicas: 1
+  maxReplicas: 10
+
+  metrics:
+    - name: "queue_depth"
+      provider: "k8s-external-metrics"
+      params:
+        metric: "pubsub_subscription_num_undelivered_messages"
+        selector: "subscription=my-task-sub"
+      gauge:
+        aggregation: "Avg"
+
+  scaling:
+    - recommender: "linear"
+      name: "queue_target"
+      params:
+        metric: "queue_depth"
+        target: "50.0" # Target 50 messages per consumer replica
