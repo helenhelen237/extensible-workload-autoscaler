@@ -4,6 +4,7 @@ IMAGE_NAME ?= xas
 .PHONY: build
 build:
 	go build -o bin/core-node-metrics-provider ./cmd/core-node-metrics-provider
+	go build -o bin/core-cluster-metrics-provider ./cmd/core-cluster-metrics-provider
 	go build -o bin/server ./cmd/server
 	go build -o bin/controller ./cmd/controller
 	go build -o bin/core-recommenders ./cmd/core-recommenders

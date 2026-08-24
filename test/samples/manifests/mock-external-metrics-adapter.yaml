@@ -1,0 +1,95 @@
+# A mock external metrics adapter to test xAS with external metrics. 
+# Generate load with command `kubectl exec -n mock-external-metrics deploy/mock-adapter -- python3 -c "import urllib.request, ssl; ctx = ssl._create_unverified_context(); urllib.request.urlopen('https://localhost:443/set_queue_depth=400', context=ctx)"`.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mock-external-metrics
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mock-adapter
+  namespace: mock-external-metrics
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mock-adapter
+  template:
+    metadata:
+      labels:
+        app: mock-adapter
+    spec:
+      containers:
+        - name: mock-adapter
+          image: python:3.9-slim
+          command: ["sh", "-c"]
+          args:
+            - |
+              openssl req -x509 -newkey rsa:2048 -keyout /tmp/key.pem -out /tmp/cert.pem -days 365 -nodes -subj "/CN=mock-adapter.mock-external-metrics.svc"
+              python3 -c "
+              import http.server, ssl, json, time
+
+              queue_depth = 10
+
+              class Handler(http.server.BaseHTTPRequestHandler):
+                  def do_GET(self):
+                      global queue_depth
+                      if '/set_queue_depth=' in self.path:
+                          queue_depth = int(self.path.split('=')[1])
+                          self.send_response(200)
+                          self.end_headers()
+                          self.wfile.write(f'Updated queue_depth to {queue_depth}\n'.encode())
+                          return
+
+                      res = {
+                          'kind': 'ExternalMetricValueList',
+                          'apiVersion': 'external.metrics.k8s.io/v1beta1',
+                          'metadata': {},
+                          'items': [{
+                              'metricName': 'pubsub_subscription_num_undelivered_messages',
+                              'metricLabels': {'subscription': 'my-task-sub'},
+                              'timestamp': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+                              'value': str(queue_depth)
+                          }]
+                      }
+                      self.send_response(200)
+                      self.send_header('Content-Type', 'application/json')
+                      self.end_headers()
+                      self.wfile.write(json.dumps(res).encode())
+
+              httpd = http.server.HTTPServer(('0.0.0.0', 443), Handler)
+              ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+              ctx.load_cert_chain(certfile='/tmp/cert.pem', keyfile='/tmp/key.pem')
+              httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+              httpd.serve_forever()
+              "
+          ports:
+            - containerPort: 443
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mock-adapter
+  namespace: mock-external-metrics
+spec:
+  ports:
+    - port: 443
+      targetPort: 443
+  selector:
+    app: mock-adapter
+---
+apiVersion: apiregistration.k8s.io/v1
+kind: APIService
+metadata:
+  name: v1beta1.external.metrics.k8s.io
+spec:
+  service:
+    name: mock-adapter
+    namespace: mock-external-metrics
+    port: 443
+  group: external.metrics.k8s.io
+  version: v1beta1
+  insecureSkipTLSVerify: true
+  groupPriorityMinimum: 100
+  versionPriority: 100
