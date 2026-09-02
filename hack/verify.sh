@@ -34,7 +34,7 @@ fi
 echo "[5/5] Checking Code Generation..."
 # Capture stderr to a temp file in case codegen fails, but keep stdout quiet
 TMP_ERR=$(mktemp)
-if ! ./hack/update-codegen.sh > /dev/null 2> "$TMP_ERR"; then
+if ! go generate ./... > /dev/null 2> "$TMP_ERR"; then
     echo "Error: Code generation failed!"
     cat "$TMP_ERR"
     rm -f "$TMP_ERR"
@@ -43,7 +43,7 @@ fi
 rm -f "$TMP_ERR"
 
 # Check for changes in generated paths
-GEN_PATHS="pkg/client deploy/crd pkg/apis/xas/v1/deepcopy_generated.go api/proto/v1"
+GEN_PATHS="pkg/client deploy/crd pkg/apis/xas/v1/deepcopy_generated.go api/proto/v1alpha"
 if ! git diff --quiet -- $GEN_PATHS; then
     echo "Error: Generated code is out of date."
     echo "The following files have changed:"

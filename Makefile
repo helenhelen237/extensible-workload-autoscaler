@@ -18,7 +18,7 @@ docker-build:
 
 .PHONY: codegen
 codegen:
-	./hack/update-codegen.sh
+	go generate ./...
 
 .PHONY: verify
 verify:
