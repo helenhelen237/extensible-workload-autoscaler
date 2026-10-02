@@ -55,9 +55,11 @@ func TestRecommendBounds(t *testing.T) {
 		wantMsgContains string
 	}{
 		{
-			name:   "no bound metrics leaves both sides unbounded",
+			name:   "owned bound metrics without data leave both sides unbounded",
 			params: params(),
 			want:   target(nil, nil),
+			wantMsgContains: `owned metric "cpu-lower-bound" not found in state, no lower bound for cpu; ` +
+				`owned metric "cpu-upper-bound" not found in state, no upper bound for cpu`,
 		},
 		{
 			name: "both bounds for cpu and memory",
@@ -112,69 +114,6 @@ func TestRecommendBounds(t *testing.T) {
 			}
 			if !strings.Contains(got.Message, tt.wantMsgContains) {
 				t.Errorf("Recommend() Message = %q, want it to contain %q", got.Message, tt.wantMsgContains)
-			}
-		})
-	}
-}
-
-func TestParseConfigBounds(t *testing.T) {
-	tests := []struct {
-		name    string
-		params  map[string]string
-		want    *config
-		wantErr bool
-	}{
-		{
-			name: "all bound metrics",
-			params: map[string]string{
-				"container":              "app",
-				"cpu-metric":             "cpu_p90",
-				"mem-metric":             "mem_p90",
-				"cpu-lower-bound-metric": "cpu_p50",
-				"cpu-upper-bound-metric": " cpu_p99 ",
-				"mem-lower-bound-metric": "mem_p50",
-				"mem-upper-bound-metric": "mem_p99",
-			},
-			want: &config{
-				containerName:       "app",
-				cpuMetric:           "cpu_p90",
-				memMetric:           "mem_p90",
-				cpuSafetyMargin:     defaultCPUSafetyMarginFloat,
-				memSafetyMargin:     defaultMemSafetyMarginFloat,
-				cpuLowerBoundMetric: "cpu_p50",
-				cpuUpperBoundMetric: "cpu_p99",
-				memLowerBoundMetric: "mem_p50",
-				memUpperBoundMetric: "mem_p99",
-			},
-		},
-		{
-			name: "cpu bound without cpu-metric",
-			params: map[string]string{
-				"container":              "app",
-				"mem-metric":             "mem_p90",
-				"cpu-lower-bound-metric": "cpu_p50",
-			},
-			wantErr: true,
-		},
-		{
-			name: "memory bound without mem-metric",
-			params: map[string]string{
-				"container":              "app",
-				"cpu-metric":             "cpu_p90",
-				"mem-upper-bound-metric": "mem_p99",
-			},
-			wantErr: true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, err := parseConfig(&pb.RecommenderDefinition{Params: tt.params})
-			if (err != nil) != tt.wantErr {
-				t.Fatalf("parseConfig() error = %v, wantErr %v", err, tt.wantErr)
-			}
-			if diff := cmp.Diff(tt.want, got, cmp.AllowUnexported(config{})); diff != "" {
-				t.Errorf("parseConfig() mismatch (-want +got):\n%s", diff)
 			}
 		})
 	}

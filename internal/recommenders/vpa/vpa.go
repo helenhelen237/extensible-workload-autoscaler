@@ -2,6 +2,7 @@ package vpa
 
 import (
 	"fmt"
+	"maps"
 	"math"
 	"strconv"
 	"strings"
@@ -14,27 +15,184 @@ const (
 	minMEMMiB                   = 10   // 10 MiB: represents the minumum Memory value returned by the recommender
 	defaultCPUSafetyMarginFloat = 1.15 // represents 15% headroom
 	defaultMemSafetyMarginFloat = 1.15 // represents 15% headroom
+
+	// Defaults of the owned metrics of a resource for which the user declares
+	// no metric.
+	defaultProvider  = "kubelet"
+	defaultScope     = "PodContainer"
+	defaultHalfLife  = "24h"
+	defaultCPUBucket = "0.05"     // 50m
+	defaultMemBucket = "10485760" // 10Mi
 )
+
+// slot is one of the metrics VPA uses for each resource it controls.
+type slot int
+
+const (
+	targetSlot slot = iota
+	lowerBoundSlot
+	upperBoundSlot
+	numSlots
+)
+
+// slotSpec describes a slot: the suffixes of its param and of its owned
+// metric name, and the percentile of its owned metric.
+type slotSpec struct {
+	paramSuffix string
+	ownedSuffix string
+	percentile  string
+}
+
+var slots = [numSlots]slotSpec{
+	targetSlot:     {paramSuffix: "-metric", ownedSuffix: "-target", percentile: "p90"},
+	lowerBoundSlot: {paramSuffix: "-lower-bound-metric", ownedSuffix: "-lower-bound", percentile: "p50"},
+	upperBoundSlot: {paramSuffix: "-upper-bound-metric", ownedSuffix: "-upper-bound", percentile: "p99"},
+}
+
+// resourceSpec describes how VPA sizes a resource.
+type resourceSpec struct {
+	// name is the resource name in the recommendation, the prefix of the
+	// owned metric names, and the "type" param of the default kubelet metric.
+	name string
+	// paramPrefix is the prefix of the params of the resource.
+	paramPrefix       string
+	defaultBucketSize string
+	defaultMargin     float64
+	unit              string
+	// value returns the recommended value of the resource, in unit, for the
+	// max value of the metric across all pods.
+	value func(podMetrics map[string]*pb.ContainerMetrics, containerName, metric string, safetyMargin float64) (int64, bool)
+}
+
+var resources = []resourceSpec{
+	{name: "cpu", paramPrefix: "cpu", defaultBucketSize: defaultCPUBucket, defaultMargin: defaultCPUSafetyMarginFloat, unit: "m", value: cpuMilliFor},
+	{name: "memory", paramPrefix: "mem", defaultBucketSize: defaultMemBucket, defaultMargin: defaultMemSafetyMarginFloat, unit: "Mi", value: memMiBFor},
+}
+
+func (s resourceSpec) param(sl slot) string {
+	return s.paramPrefix + slots[sl].paramSuffix
+}
+
+func (s resourceSpec) ownedName(sl slot) string {
+	return s.name + slots[sl].ownedSuffix
+}
 
 type VPARecommender struct{}
 
-// config holds the parsed configuration for this recommender instance
-type config struct {
-	containerName   string
-	cpuMetric       string
-	memMetric       string
-	cpuSafetyMargin float64
-	memSafetyMargin float64
-	// Optional metrics for the bounds (e.g. P50 for the lower bound and P99
-	// for the upper bound). Empty means that side is unbounded.
-	cpuLowerBoundMetric string
-	cpuUpperBoundMetric string
-	memLowerBoundMetric string
-	memUpperBoundMetric string
+// metricRef is the metric used for a slot: either a policy-wide metric the
+// user configured, or a metric owned by the recommender.
+type metricRef struct {
+	name  string
+	owned bool
 }
 
-// Recommend calculates the resource recommendations based on control metrics
-func (r *VPARecommender) Recommend(def *pb.RecommenderDefinition, state, _ *pb.ControlMetrics) *pb.Recommendation {
+// resourceConfig holds the configuration of a controlled resource.
+type resourceConfig struct {
+	safetyMargin float64
+	metrics      [numSlots]metricRef
+}
+
+// config holds the parsed configuration for this recommender instance
+type config struct {
+	containerName string
+	// resources holds the controlled resources, keyed by resource name.
+	resources map[string]*resourceConfig
+}
+
+// OwnedMetrics returns the metrics VPA owns: one per slot the user didn't
+// configure, for each controlled resource. Owned metrics copy the source
+// (provider, params, filter, scope) and the half-life and bucket size of the
+// user's metrics for the same resource, if any, so all the metrics of a
+// resource share them; otherwise they use the defaults.
+//
+// It returns an error if the configuration is invalid, including when a
+// configured metric isn't defined in the policy, isn't a decaying
+// distribution, or differs from the other metrics of its resource in half-life
+// or bucket size.
+func (r *VPARecommender) OwnedMetrics(def *pb.RecommenderDefinition, policyMetrics []*pb.MetricDefinition) ([]*pb.MetricDefinition, error) {
+	cfg, err := parseConfig(def)
+	if err != nil {
+		return nil, err
+	}
+	byName := make(map[string]*pb.MetricDefinition, len(policyMetrics))
+	for _, m := range policyMetrics {
+		byName[m.Name] = m
+	}
+
+	var owned []*pb.MetricDefinition
+	for _, res := range resources {
+		rc, ok := cfg.resources[res.name]
+		if !ok {
+			continue
+		}
+
+		// The user's metrics for this resource. The first one is the
+		// template of the owned metrics.
+		var template *pb.MetricDefinition
+		var templateParam string
+		for sl := range numSlots {
+			ref := rc.metrics[sl]
+			if ref.owned {
+				continue
+			}
+			m, ok := byName[ref.name]
+			if !ok {
+				return nil, fmt.Errorf("%s %q is not defined in the policy metrics", res.param(sl), ref.name)
+			}
+			dd := m.GetDecayingDistribution()
+			if dd == nil {
+				return nil, fmt.Errorf("%s %q must be a decayingDistribution metric", res.param(sl), ref.name)
+			}
+			if template == nil {
+				template, templateParam = m, res.param(sl)
+				continue
+			}
+			tdd := template.GetDecayingDistribution()
+			if dd.HalfLife != tdd.HalfLife || dd.BucketSize != tdd.BucketSize {
+				return nil, fmt.Errorf("the %s metrics must have the same halfLife and bucketSize: %s %q has %q and %q, %s %q has %q and %q",
+					res.name, templateParam, template.Name, tdd.HalfLife, tdd.BucketSize, res.param(sl), ref.name, dd.HalfLife, dd.BucketSize)
+			}
+		}
+		if template == nil {
+			template = &pb.MetricDefinition{
+				Provider: defaultProvider,
+				Params:   map[string]string{"type": res.name},
+				Scope:    defaultScope,
+				DecayingDistribution: &pb.DecayingDistribution{
+					HalfLife:   defaultHalfLife,
+					BucketSize: res.defaultBucketSize,
+				},
+			}
+		}
+
+		for sl := range numSlots {
+			ref := rc.metrics[sl]
+			if !ref.owned {
+				continue
+			}
+			tdd := template.GetDecayingDistribution()
+			owned = append(owned, &pb.MetricDefinition{
+				Name:     ref.name,
+				Provider: template.Provider,
+				Params:   maps.Clone(template.Params),
+				Filter:   maps.Clone(template.Filter),
+				Scope:    template.Scope,
+				DecayingDistribution: &pb.DecayingDistribution{
+					HalfLife:   tdd.HalfLife,
+					BucketSize: tdd.BucketSize,
+					Rate:       tdd.Rate,
+					Percentile: slots[sl].percentile,
+				},
+			})
+		}
+	}
+	return owned, nil
+}
+
+// Recommend calculates the resource recommendations based on control metrics.
+// Slots configured by the user are read from the policy-wide metrics, and the
+// others from the metrics owned by the recommender.
+func (r *VPARecommender) Recommend(def *pb.RecommenderDefinition, state, ownedMetrics *pb.ControlMetrics) *pb.Recommendation {
 	var warnings []string
 
 	//Parse the configuration from def.Params using parseConfig.
@@ -48,114 +206,97 @@ func (r *VPARecommender) Recommend(def *pb.RecommenderDefinition, state, _ *pb.C
 		}
 	}
 
-	if state == nil {
+	if state == nil && ownedMetrics == nil {
 		return &pb.Recommendation{
 			IsActive: false,
 			Message:  "ControlMetrics is missing",
 		}
 	}
-	if len(state.PodContainerMetrics) == 0 {
+	if len(state.GetPodContainerMetrics()) == 0 && len(ownedMetrics.GetPodContainerMetrics()) == 0 {
 		return &pb.Recommendation{
 			IsActive: false,
-			Message:  "PodMetrics is empty (ensure metrics are configured with scope: Container)",
+			Message:  "PodMetrics is empty (ensure metrics are configured with scope: PodContainer)",
 		}
 	}
-
-	cpuMetricFound := false
-	memMetricFound := false
 
 	requests := make(map[string]string, 2)
 	limits := make(map[string]string, 2)
 	lowerBound := make(map[string]string, 2)
 	upperBound := make(map[string]string, 2)
 
-	// addBounds sets the bounds of a resource from their metrics, clamped so
-	// that lower <= target <= upper. A bound whose metric is not configured,
-	// or has no data, is left out (unbounded).
-	addBounds := func(resName, unit, lowerParam, lowerMetric, upperParam, upperMetric string, target int64, value func(metric string) (int64, bool)) {
-		if lowerMetric != "" {
-			if v, ok := value(lowerMetric); ok {
-				lowerBound[resName] = fmt.Sprintf("%d%s", min(v, target), unit)
-			} else {
-				warnings = append(warnings, fmt.Sprintf("%s %q not found in state, no lower bound for %s", lowerParam, lowerMetric, resName))
+	for _, res := range resources {
+		rc, ok := cfg.resources[res.name]
+		if !ok {
+			continue
+		}
+		// describe names the metric of a slot in warnings.
+		describe := func(sl slot) string {
+			ref := rc.metrics[sl]
+			if ref.owned {
+				return fmt.Sprintf("owned metric %q", ref.name)
 			}
+			return fmt.Sprintf("%s %q", res.param(sl), ref.name)
 		}
-		if upperMetric != "" {
-			if v, ok := value(upperMetric); ok {
-				upperBound[resName] = fmt.Sprintf("%d%s", max(v, target), unit)
-			} else {
-				warnings = append(warnings, fmt.Sprintf("%s %q not found in state, no upper bound for %s", upperParam, upperMetric, resName))
+		value := func(sl slot) (int64, bool) {
+			ref := rc.metrics[sl]
+			src := state
+			if ref.owned {
+				src = ownedMetrics
 			}
+			return res.value(src.GetPodContainerMetrics(), cfg.containerName, ref.name, rc.safetyMargin)
 		}
-	}
 
-	// If cpuMetric is configured (is not empty):
-	if cfg.cpuMetric != "" {
-		cpuValue := func(metric string) (int64, bool) {
-			return cpuMilliFor(state.PodContainerMetrics, cfg.containerName, metric, cfg.cpuSafetyMargin)
+		target, found := value(targetSlot)
+		if !found {
+			warnings = append(warnings, fmt.Sprintf("%s not found in state", describe(targetSlot)))
+			continue
 		}
-		// Getting the max CPU usage value of that container across all pods
-		cpuVal, found := cpuValue(cfg.cpuMetric)
-		if found {
-			cpuValString := fmt.Sprintf("%dm", cpuVal)
-			cpuMetricFound = true
-			requests["cpu"] = cpuValString
-			limits["cpu"] = cpuValString
-			addBounds("cpu", "m", "cpu-lower-bound-metric", cfg.cpuLowerBoundMetric, "cpu-upper-bound-metric", cfg.cpuUpperBoundMetric, cpuVal, cpuValue)
+		requests[res.name] = fmt.Sprintf("%d%s", target, res.unit)
+		limits[res.name] = requests[res.name]
 
+		// The bounds are clamped so that lower <= target <= upper. A bound
+		// whose metric has no data is left out (unbounded).
+		if v, ok := value(lowerBoundSlot); ok {
+			lowerBound[res.name] = fmt.Sprintf("%d%s", min(v, target), res.unit)
 		} else {
-			warnings = append(warnings, fmt.Sprintf("cpuMetric %q not found in state", cfg.cpuMetric))
+			warnings = append(warnings, fmt.Sprintf("%s not found in state, no lower bound for %s", describe(lowerBoundSlot), res.name))
 		}
-	}
-
-	if cfg.memMetric != "" {
-		memValue := func(metric string) (int64, bool) {
-			return memMiBFor(state.PodContainerMetrics, cfg.containerName, metric, cfg.memSafetyMargin)
-		}
-		memVal, found := memValue(cfg.memMetric)
-		if found {
-			memValString := fmt.Sprintf("%dMi", memVal)
-			memMetricFound = true
-			requests["memory"] = memValString
-			limits["memory"] = memValString
-			addBounds("memory", "Mi", "mem-lower-bound-metric", cfg.memLowerBoundMetric, "mem-upper-bound-metric", cfg.memUpperBoundMetric, memVal, memValue)
-
+		if v, ok := value(upperBoundSlot); ok {
+			upperBound[res.name] = fmt.Sprintf("%d%s", max(v, target), res.unit)
 		} else {
-			warnings = append(warnings, fmt.Sprintf("memMetric %q not found in state", cfg.memMetric))
+			warnings = append(warnings, fmt.Sprintf("%s not found in state, no upper bound for %s", describe(upperBoundSlot), res.name))
 		}
 	}
 
 	// If no valid recommendations were generated, returning a recommendation with an error
-	if !cpuMetricFound && !memMetricFound {
+	if len(requests) == 0 {
 		warnings = append(warnings, "Unable to create recommendation as no value memory or cpu values were found")
 
 		return &pb.Recommendation{
 			IsActive: false,
 			Message:  fmt.Sprintf("No Recommendations generated: %s", strings.Join(warnings, "; ")),
 		}
-	} else {
-		res := &pb.ContainerResource{
-			ContainerName: cfg.containerName,
-			Requests:      requests,
-			Limits:        limits,
-		}
-		if len(lowerBound) > 0 {
-			res.LowerBound = lowerBound
-		}
-		if len(upperBound) > 0 {
-			res.UpperBound = upperBound
-		}
-		return &pb.Recommendation{
-			IsActive:          true,
-			WorkloadResources: []*pb.ContainerResource{res},
-			Message: func() string {
-				if len(warnings) > 0 {
-					return fmt.Sprintf("Recommendation generated with warnings: %s", strings.Join(warnings, "; "))
-				} else {
-					return "Recommendation generated successfully."
-				}
-			}(),
-		}
+	}
+
+	res := &pb.ContainerResource{
+		ContainerName: cfg.containerName,
+		Requests:      requests,
+		Limits:        limits,
+	}
+	if len(lowerBound) > 0 {
+		res.LowerBound = lowerBound
+	}
+	if len(upperBound) > 0 {
+		res.UpperBound = upperBound
+	}
+	msg := "Recommendation generated successfully."
+	if len(warnings) > 0 {
+		msg = fmt.Sprintf("Recommendation generated with warnings: %s", strings.Join(warnings, "; "))
+	}
+	return &pb.Recommendation{
+		IsActive:          true,
+		WorkloadResources: []*pb.ContainerResource{res},
+		Message:           msg,
 	}
 }
 
@@ -205,61 +346,95 @@ func getMaxVal(podMetrics map[string]*pb.ContainerMetrics, containerName, metric
 	return maxVal, found
 }
 
-// parseConfig extracts and validates parameters from the recommender definition
+// parseConfig extracts and validates parameters from the recommender
+// definition. It doesn't check the configured metrics against the policy; see
+// OwnedMetrics.
 func parseConfig(def *pb.RecommenderDefinition) (*config, error) {
-	cpuMetric := def.Params["cpu-metric"]
-	memMetric := def.Params["mem-metric"]
-	container := def.Params["container"]
-
-	if cpuMetric == "" && memMetric == "" {
-		return nil, fmt.Errorf("cpu-metric and mem-metric are undefined. For VPA to work at least one of them needs to be defined.")
-	}
-	container = strings.TrimSpace(container)
+	container := strings.TrimSpace(def.Params["container"])
 	if container == "" {
 		return nil, fmt.Errorf("container is undefined. For VPA to work, one container needs to be defined.")
 	}
 
-	config := &config{
-		cpuMetric:       cpuMetric,
-		memMetric:       memMetric,
-		containerName:   container,
-		cpuSafetyMargin: defaultCPUSafetyMarginFloat,
-		memSafetyMargin: defaultMemSafetyMarginFloat,
-
-		cpuLowerBoundMetric: strings.TrimSpace(def.Params["cpu-lower-bound-metric"]),
-		cpuUpperBoundMetric: strings.TrimSpace(def.Params["cpu-upper-bound-metric"]),
-		memLowerBoundMetric: strings.TrimSpace(def.Params["mem-lower-bound-metric"]),
-		memUpperBoundMetric: strings.TrimSpace(def.Params["mem-upper-bound-metric"]),
-	}
-
-	// Bounds are computed around the target, so they need one.
-	if cpuMetric == "" && (config.cpuLowerBoundMetric != "" || config.cpuUpperBoundMetric != "") {
-		return nil, fmt.Errorf("cpu-lower-bound-metric and cpu-upper-bound-metric require cpu-metric to be defined")
-	}
-	if memMetric == "" && (config.memLowerBoundMetric != "" || config.memUpperBoundMetric != "") {
-		return nil, fmt.Errorf("mem-lower-bound-metric and mem-upper-bound-metric require mem-metric to be defined")
-	}
-
-	cpuSafetyMargin := def.Params["cpu-safety-margin"]
-	if cpuSafetyMargin != "" {
-		cpuSafetyMarginFloat, err := strconv.ParseFloat(strings.TrimSpace(cpuSafetyMargin), 64)
-		if err != nil {
-			return nil, fmt.Errorf("invalid cpu-safety-margin provided %s. The value needs to represent a float64. err: %w", cpuSafetyMargin, err)
-		} else {
-			config.cpuSafetyMargin = cpuSafetyMarginFloat
+	// The metrics configured by the user, per resource and slot.
+	userMetrics := make(map[string][numSlots]string, len(resources))
+	for _, res := range resources {
+		var names [numSlots]string
+		set := false
+		for sl := range numSlots {
+			names[sl] = strings.TrimSpace(def.Params[res.param(sl)])
+			set = set || names[sl] != ""
+		}
+		if set {
+			userMetrics[res.name] = names
 		}
 	}
 
-	memSafetyMargin := def.Params["mem-safety-margin"]
-
-	if memSafetyMargin != "" {
-		memSafetyMarginFloat, err := strconv.ParseFloat(strings.TrimSpace(memSafetyMargin), 64)
-		if err != nil {
-			return nil, fmt.Errorf("invalid mem-safety-margin provided %s. The value needs to represent a float64. err: %w", memSafetyMargin, err)
-		} else {
-			config.memSafetyMargin = memSafetyMarginFloat
+	controlled, err := parseControlledResources(def.Params["controlled-resources"], userMetrics)
+	if err != nil {
+		return nil, err
+	}
+	for _, res := range resources {
+		if _, ok := userMetrics[res.name]; ok && !controlled[res.name] {
+			return nil, fmt.Errorf("%s metric params are set, but %s is not in controlled-resources", res.name, res.name)
 		}
 	}
 
-	return config, nil
+	cfg := &config{
+		containerName: container,
+		resources:     make(map[string]*resourceConfig, len(controlled)),
+	}
+	for _, res := range resources {
+		margin := res.defaultMargin
+		marginParam := res.paramPrefix + "-safety-margin"
+		if s := def.Params[marginParam]; s != "" {
+			margin, err = strconv.ParseFloat(strings.TrimSpace(s), 64)
+			if err != nil {
+				return nil, fmt.Errorf("invalid %s provided %s. The value needs to represent a float64. err: %w", marginParam, s, err)
+			}
+		}
+		if !controlled[res.name] {
+			continue
+		}
+		rc := &resourceConfig{safetyMargin: margin}
+		names := userMetrics[res.name]
+		for sl := range numSlots {
+			if names[sl] != "" {
+				rc.metrics[sl] = metricRef{name: names[sl]}
+			} else {
+				rc.metrics[sl] = metricRef{name: res.ownedName(sl), owned: true}
+			}
+		}
+		cfg.resources[res.name] = rc
+	}
+	return cfg, nil
+}
+
+// parseControlledResources parses the controlled-resources param: a comma
+// separated list of resources. When unset, VPA controls the resources the user
+// set metric params for, or all of them if none.
+func parseControlledResources(param string, userMetrics map[string][numSlots]string) (map[string]bool, error) {
+	controlled := make(map[string]bool, len(resources))
+	if strings.TrimSpace(param) == "" {
+		for _, res := range resources {
+			_, set := userMetrics[res.name]
+			controlled[res.name] = set || len(userMetrics) == 0
+		}
+		return controlled, nil
+	}
+
+	for _, name := range strings.Split(param, ",") {
+		name = strings.TrimSpace(name)
+		known := false
+		for _, res := range resources {
+			if res.name == name {
+				known = true
+				break
+			}
+		}
+		if !known {
+			return nil, fmt.Errorf("invalid controlled-resources %q: %q is not one of cpu, memory", param, name)
+		}
+		controlled[name] = true
+	}
+	return controlled, nil
 }
