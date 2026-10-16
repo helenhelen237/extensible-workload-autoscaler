@@ -239,7 +239,7 @@ func (s *MemoryStore) AddBatch(req *pb.IngestMetricsRequest) error {
 			return fmt.Errorf("policy not found: %s", key)
 		}
 
-		if err := ps.Metrics.IngestMetrics(ps.Policy, pBatch.GetBatches(), req.GetTimestamp().AsTime()); err != nil {
+		if err := ps.Metrics.IngestMetrics(ps.Policy, ps.Workload, pBatch.GetBatches(), req.GetTimestamp().AsTime()); err != nil {
 			return err
 		}
 	}

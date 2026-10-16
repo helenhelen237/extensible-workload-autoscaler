@@ -2,6 +2,7 @@ package grpc_test
 
 import (
 	"context"
+	"math"
 	"net"
 	"testing"
 	"time"
@@ -903,6 +904,101 @@ func TestGetControlMetrics_TerminatingPod(t *testing.T) {
 	}.Build()
 	if diff := cmp.Diff(wantCM, cm, protocmp.Transform(), protocmp.IgnoreDefaultScalars()); diff != "" {
 		t.Errorf("ControlMetrics mismatch (-want +got):\n%s", diff)
+	}
+}
+
+// The samples of a global decaying distribution all feed one workload-wide
+// histogram, so the ones of the pods that aren't eligible must be dropped when
+// they are ingested: once in the histogram they can't be told apart.
+func TestIngestMetrics_GlobalDecayingDistributionIgnoresNonEligiblePods(t *testing.T) {
+	clk := &clock.FakeClock{CurrentTime: time.Unix(10000, 0)}
+	memStore, client, cleanup := setupFunctionalGRPCServer(t, clk)
+	defer cleanup()
+	ctx := context.Background()
+
+	id := pb.PolicyId_builder{ClusterName: proto.String("c1"), Namespace: proto.String("ns"), Name: proto.String("p1")}.Build()
+	client.CreatePolicy(ctx, pb.CreatePolicyRequest_builder{
+		Policy: pb.Policy_builder{
+			Id: id,
+			Metrics: []*pb.MetricDefinition{pb.MetricDefinition_builder{
+				Name: proto.String("m_max"), DecayingDistribution: pb.DecayingDistribution_builder{HalfLife: durationpb.New(time.Hour), BucketSize: proto.String("1"), Percentile: proto.String("p100")}.Build(),
+			}.Build()},
+		}.Build(),
+	}.Build())
+
+	start := timestamppb.New(time.Unix(1000, 0))
+	at := func(offset time.Duration) *timestamppb.Timestamp {
+		return timestamppb.New(time.Unix(1000, 0).Add(offset))
+	}
+	client.UpdateWorkload(ctx, pb.UpdateWorkloadRequest_builder{
+		Id: id,
+		Workload: pb.Workload_builder{Pods: []*pb.PodState{
+			pb.PodState_builder{Name: proto.String("pod-ready"), Phase: proto.String("Running"), StartTime: start, IsReady: proto.Bool(true), ReadyLastTransitionTime: at(10 * time.Second)}.Build(),
+			// Was ready, became unready later: eligible.
+			pb.PodState_builder{Name: proto.String("pod-unready-later"), Phase: proto.String("Running"), StartTime: start, IsReady: proto.Bool(false), ReadyLastTransitionTime: at(time.Hour)}.Build(),
+			// Still starting up: not eligible.
+			pb.PodState_builder{Name: proto.String("pod-never-ready"), Phase: proto.String("Running"), StartTime: start, IsReady: proto.Bool(false), ReadyLastTransitionTime: at(time.Second)}.Build(),
+		}}.Build(),
+	}.Build())
+
+	ts := clk.Now().Unix()
+	client.IngestMetrics(ctx, pb.IngestMetricsRequest_builder{
+		ClusterName: proto.String("c1"), Timestamp: timestamppb.New(time.Unix(ts, 0)),
+		Policies: []*pb.PolicyBatch{pb.PolicyBatch_builder{
+			Namespace: proto.String("ns"), Name: proto.String("p1"),
+			Batches: []*pb.MetricBatch{
+				pb.MetricBatch_builder{PodName: proto.String("pod-ready"), Samples: []*pb.MetricSample{pb.MetricSample_builder{Name: proto.String("m_max"), Value: proto.Float64(10)}.Build()}}.Build(),
+				pb.MetricBatch_builder{PodName: proto.String("pod-unready-later"), Samples: []*pb.MetricSample{pb.MetricSample_builder{Name: proto.String("m_max"), Value: proto.Float64(20)}.Build()}}.Build(),
+				pb.MetricBatch_builder{PodName: proto.String("pod-never-ready"), Samples: []*pb.MetricSample{pb.MetricSample_builder{Name: proto.String("m_max"), Value: proto.Float64(100)}.Build()}}.Build(), // Should be ignored
+				pb.MetricBatch_builder{PodName: proto.String("pod-unknown"), Samples: []*pb.MetricSample{pb.MetricSample_builder{Name: proto.String("m_max"), Value: proto.Float64(200)}.Build()}}.Build(),     // Should be ignored
+			},
+		}.Build()},
+	}.Build())
+
+	memStore.CalculateAll()
+	cm, _ := client.GetControlMetrics(ctx, pb.GetControlMetricsRequest_builder{Id: id}.Build())
+
+	// The p100 is the upper bound of the bucket of the largest eligible
+	// sample (20, in a bucket of size 1).
+	if got := cm.GetValues()["m_max"]; math.Abs(got-21) > 1e-9 {
+		t.Errorf("m_max = %v, want 21 (the never-ready and unknown pods' samples must be ignored)", got)
+	}
+}
+
+// Per-series metrics keep the samples of the pods the Server has not been told
+// about yet, and consider them once the workload reports the pod.
+func TestIngestMetrics_PerSeriesMetricKeepsSamplesOfPodsReportedLater(t *testing.T) {
+	clk := &clock.FakeClock{CurrentTime: time.Unix(10000, 0)}
+	memStore, client, cleanup := setupFunctionalGRPCServer(t, clk)
+	defer cleanup()
+	ctx := context.Background()
+
+	id := pb.PolicyId_builder{ClusterName: proto.String("c1"), Namespace: proto.String("ns"), Name: proto.String("p1")}.Build()
+	client.CreatePolicy(ctx, pb.CreatePolicyRequest_builder{
+		Policy: pb.Policy_builder{
+			Id:      id,
+			Metrics: []*pb.MetricDefinition{pb.MetricDefinition_builder{Name: proto.String("m1"), Gauge: pb.Gauge_builder{Aggregation: proto.String("Sum")}.Build()}.Build()},
+		}.Build(),
+	}.Build())
+
+	// The sample arrives before the workload reports the pod.
+	ts := clk.Now().Unix()
+	client.IngestMetrics(ctx, pb.IngestMetricsRequest_builder{
+		ClusterName: proto.String("c1"), Timestamp: timestamppb.New(time.Unix(ts, 0)),
+		Policies: []*pb.PolicyBatch{pb.PolicyBatch_builder{
+			Namespace: proto.String("ns"), Name: proto.String("p1"),
+			Batches: []*pb.MetricBatch{pb.MetricBatch_builder{PodName: proto.String("pod-new"), Samples: []*pb.MetricSample{pb.MetricSample_builder{Name: proto.String("m1"), Value: proto.Float64(10)}.Build()}}.Build()},
+		}.Build()},
+	}.Build())
+	client.UpdateWorkload(ctx, pb.UpdateWorkloadRequest_builder{
+		Id:       id,
+		Workload: pb.Workload_builder{Pods: []*pb.PodState{pb.PodState_builder{Name: proto.String("pod-new"), IsReady: proto.Bool(true)}.Build()}}.Build(),
+	}.Build())
+
+	memStore.CalculateAll()
+	cm, _ := client.GetControlMetrics(ctx, pb.GetControlMetricsRequest_builder{Id: id}.Build())
+	if got := cm.GetValues()["m1"]; got != 10 {
+		t.Errorf("m1 = %v, want 10", got)
 	}
 }
 

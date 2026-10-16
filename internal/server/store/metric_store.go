@@ -65,10 +65,12 @@ func NewMetricStore() *MetricStore {
 }
 
 // IngestMetrics ingests a slice of metric batches for the given policy.
-func (ms *MetricStore) IngestMetrics(policy *pb.Policy, batches []*pb.MetricBatch, ingestTime time.Time) error {
+// IngestMetrics ingests the given metric batches of a policy. workload is
+// the current state of the policy's pods, keyed by name.
+func (ms *MetricStore) IngestMetrics(policy *pb.Policy, workload map[string]*pb.PodState, batches []*pb.MetricBatch, ingestTime time.Time) error {
 	for _, batch := range batches {
 		for _, m := range batch.GetSamples() {
-			if err := ms.ingestSample(policy, batch.GetPodName(), batch.GetContainerName(), m, ingestTime); err != nil {
+			if err := ms.ingestSample(policy, workload, batch.GetPodName(), batch.GetContainerName(), m, ingestTime); err != nil {
 				return err
 			}
 		}
@@ -95,7 +97,7 @@ func findMetricDefinition(policy *pb.Policy, owner, name string) *pb.MetricDefin
 	return nil
 }
 
-func (ms *MetricStore) ingestSample(policy *pb.Policy, podName, containerName string, sample *pb.MetricSample, ingestTime time.Time) error {
+func (ms *MetricStore) ingestSample(policy *pb.Policy, workload map[string]*pb.PodState, podName, containerName string, sample *pb.MetricSample, ingestTime time.Time) error {
 	owner := sample.GetRecommenderName()
 	def := findMetricDefinition(policy, owner, sample.GetName())
 	if def == nil {
@@ -115,6 +117,14 @@ func (ms *MetricStore) ingestSample(policy *pb.Policy, podName, containerName st
 	if !ok {
 		metricSeries = newMetricSeries(def, podName, containerName, sample)
 		ms.Series[id] = metricSeries
+	}
+	// The samples of the metrics aggregated in a single workload-wide time
+	// window can't be filtered when they are aggregated, so the ones of the
+	// pods that aren't eligible are dropped now. The other metrics keep every
+	// sample and filter the series when they are aggregated, which also
+	// covers the pods the Server has not been told about yet.
+	if podName != "" && metricSeries.Aggregation.SharesTimeWindow() && !isEligiblePod(workload, podName) {
+		return nil
 	}
 	sid := model.NewSeriesID(podName, containerName, sample.GetLabels())
 	series, ok := metricSeries.getSeries(sid)
@@ -242,6 +252,13 @@ func filterInitializingCPU(series iter.Seq[*model.Series], workload map[string]*
 			}
 		}
 	}
+}
+
+// isEligiblePod reports whether the metrics of the named pod of the workload
+// should be considered. Pods unknown to the workload are not eligible.
+func isEligiblePod(workload map[string]*pb.PodState, podName string) bool {
+	p, ok := workload[podName]
+	return ok && podutil.IsEligible(podutil.FromPodState(p))
 }
 
 // filterEligiblePods returns the pods of the workload whose metrics should be

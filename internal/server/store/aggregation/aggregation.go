@@ -31,6 +31,12 @@ type SeriesAggregation interface {
 	// Reduce aggregates the series of a metric, returning one aggregate for
 	// the global scope, one aggregate per pod for the pod scope, etc.
 	Reduce(series iter.Seq[*model.Series], workload map[string]*pb.PodState) []*SeriesAggregate
+	// SharesTimeWindow reports whether every series of the metric feeds a
+	// single workload-wide time window rather than its own. The samples of
+	// such a metric cannot be told apart once ingested, so the ones that must
+	// not take part in the aggregation (e.g. because they describe a pod that
+	// isn't eligible) have to be dropped at ingestion.
+	SharesTimeWindow() bool
 }
 
 // DimensionalSeriesAggregation aggregates series one dimension at a time:
@@ -68,6 +74,11 @@ func (a *DimensionalSeriesAggregation) NewTimeWindow(def *pb.MetricDefinition) m
 		return a.WorkloadTimeWindow
 	}
 	return NewTimeWindow(def)
+}
+
+// SharesTimeWindow implements SeriesAggregation.
+func (a *DimensionalSeriesAggregation) SharesTimeWindow() bool {
+	return a.WorkloadTimeWindow != nil
 }
 
 // Reduce implements SeriesAggregation.
