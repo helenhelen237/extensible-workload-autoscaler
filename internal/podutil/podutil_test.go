@@ -97,63 +97,62 @@ func TestIsEligible(t *testing.T) {
 func TestIsCPUSampleEligible(t *testing.T) {
 	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	ready := start.Add(time.Minute)
-	window := 30 * time.Second
 	// Lifecycle of a pod that became ready one minute after it started.
 	readyPod := Lifecycle{Phase: corev1.PodRunning, StartTime: start, Ready: true, ReadyLastTransitionTime: ready}
 	unreadyPod := Lifecycle{Phase: corev1.PodRunning, StartTime: start, Ready: false, ReadyLastTransitionTime: ready}
 	tests := []struct {
-		name       string
-		l          Lifecycle
-		sampleTime time.Time
-		now        time.Time
-		want       bool
+		name         string
+		l            Lifecycle
+		measuredFrom time.Time
+		now          time.Time
+		want         bool
 	}{
 		{
-			name:       "initializing: sample measured entirely after the pod became ready",
-			l:          readyPod,
-			sampleTime: ready.Add(window),
-			now:        start.Add(2 * time.Minute),
-			want:       true,
+			name:         "initializing: sample measured from the readiness transition",
+			l:            readyPod,
+			measuredFrom: ready,
+			now:          start.Add(2 * time.Minute),
+			want:         true,
 		},
 		{
-			name:       "initializing: sample measured partly before the pod became ready",
-			l:          readyPod,
-			sampleTime: ready.Add(window - time.Second),
-			now:        start.Add(2 * time.Minute),
-			want:       false,
+			name:         "initializing: sample measured from before the pod became ready",
+			l:            readyPod,
+			measuredFrom: ready.Add(-time.Second),
+			now:          start.Add(2 * time.Minute),
+			want:         false,
 		},
 		{
-			name:       "initializing: pod not ready",
-			l:          unreadyPod,
-			sampleTime: ready.Add(10 * time.Minute),
-			now:        start.Add(2 * time.Minute),
-			want:       false,
+			name:         "initializing: pod not ready",
+			l:            unreadyPod,
+			measuredFrom: ready.Add(10 * time.Minute),
+			now:          start.Add(2 * time.Minute),
+			want:         false,
 		},
 		{
-			name:       "past the initialization period: sample counts even if measured before readiness",
-			l:          readyPod,
-			sampleTime: ready.Add(window - time.Second),
-			now:        start.Add(CPUInitializationPeriod),
-			want:       true,
+			name:         "past the initialization period: sample counts even if measured from before readiness",
+			l:            readyPod,
+			measuredFrom: ready.Add(-time.Second),
+			now:          start.Add(CPUInitializationPeriod),
+			want:         true,
 		},
 		{
-			name:       "past the initialization period: unready pod counts",
-			l:          unreadyPod,
-			sampleTime: ready.Add(10 * time.Minute),
-			now:        start.Add(10 * time.Minute),
-			want:       true,
+			name:         "past the initialization period: unready pod counts",
+			l:            unreadyPod,
+			measuredFrom: ready.Add(10 * time.Minute),
+			now:          start.Add(10 * time.Minute),
+			want:         true,
 		},
 		{
-			name:       "no start time: not acknowledged by the kubelet yet",
-			l:          Lifecycle{Ready: true},
-			sampleTime: ready,
-			now:        ready,
-			want:       false,
+			name:         "no start time: not acknowledged by the kubelet yet",
+			l:            Lifecycle{Ready: true},
+			measuredFrom: ready,
+			now:          ready,
+			want:         false,
 		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := IsCPUSampleEligible(tc.l, tc.sampleTime, window, tc.now); got != tc.want {
+			if got := IsCPUSampleEligible(tc.l, tc.measuredFrom, tc.now); got != tc.want {
 				t.Errorf("IsCPUSampleEligible() = %v, want %v", got, tc.want)
 			}
 		})

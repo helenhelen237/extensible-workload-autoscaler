@@ -70,9 +70,10 @@ func IsEligible(l Lifecycle) bool {
 // counts if the pod is ready and the sample was entirely measured after the
 // pod became ready, as in the HPA.
 //
-// The sample was measured over [sampleTime - window, sampleTime]; window is
-// zero for instantaneous values. now is the time of the evaluation.
-func IsCPUSampleEligible(l Lifecycle, sampleTime time.Time, window time.Duration, now time.Time) bool {
+// measuredFrom is the start of the interval the sample was measured over (the
+// sample's own timestamp for an instantaneous value). now is the time of the
+// evaluation.
+func IsCPUSampleEligible(l Lifecycle, measuredFrom, now time.Time) bool {
 	// Without a start time, the pod has not been acknowledged by the kubelet
 	// yet, so it cannot have a meaningful CPU sample.
 	if l.StartTime.IsZero() {
@@ -84,11 +85,10 @@ func IsCPUSampleEligible(l Lifecycle, sampleTime time.Time, window time.Duration
 	if !now.Before(l.StartTime.Add(CPUInitializationPeriod)) {
 		return true
 	}
-	// Within the initialization period: the pod must be ready, and the whole
-	// sample interval must start at or after the last readiness transition,
-	// i.e. sampleTime - window >= ReadyLastTransitionTime. Otherwise part of
-	// the measured CPU dates from before the pod was ready.
-	return l.Ready && !sampleTime.Before(l.ReadyLastTransitionTime.Add(window))
+	// Within the initialization period: the pod must be ready, and the sample
+	// interval must start at or after the last readiness transition. Otherwise
+	// part of the measured CPU dates from before the pod was ready.
+	return l.Ready && !measuredFrom.Before(l.ReadyLastTransitionTime)
 }
 
 // ReadyCondition returns the pod's Ready condition, or nil if it has none.

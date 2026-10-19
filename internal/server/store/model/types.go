@@ -82,6 +82,13 @@ func NewSeries(podName, containerName, resourceName string, labels map[string]st
 
 // AddSample feeds sample, ingested at time now, to the time window of
 // the series and records it as the latest raw sample.
+// LastRawStart returns the start of the interval LastRaw was measured over:
+// the timestamp of the sample before it, or its own timestamp for the first
+// sample of the series.
+func (s *Series) LastRawStart() time.Time {
+	return s.LastRaw.Timestamp.Add(-s.LastRawWindow)
+}
+
 func (s *Series) AddSample(sample Sample, now time.Time) {
 	s.TimeWindow.AddSample(sample, now)
 	if !s.LastRaw.Timestamp.IsZero() {

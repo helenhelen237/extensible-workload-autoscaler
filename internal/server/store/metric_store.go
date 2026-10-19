@@ -233,7 +233,7 @@ func filterInitializingCPU(series iter.Seq[*model.Series], workload map[string]*
 	return func(yield func(*model.Series) bool) {
 		for ser := range series {
 			if ser.ResourceName == "cpu" {
-				if pod, ok := workload[ser.PodName]; ok && !podutil.IsCPUSampleEligible(podutil.FromPodState(pod), ser.LastRaw.Timestamp, ser.LastRawWindow, now) {
+				if pod, ok := workload[ser.PodName]; ok && !podutil.IsCPUSampleEligible(podutil.FromPodState(pod), ser.LastRawStart(), now) {
 					continue
 				}
 			}
