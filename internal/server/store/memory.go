@@ -454,8 +454,8 @@ func (s *MemoryStore) CalculateAll() {
 // policy-wide control metrics and, keyed by recommender name, the control
 // metrics owned by each recommender (none if the policy defines none), along
 // with the state of the workload they were calculated against: the
-// calculation time and the number of ready replicas. The policy state is not
-// modified. The caller must hold mu.
+// calculation time and the numbers of eligible and ineligible pods. The policy
+// state is not modified. The caller must hold mu.
 func calculatePolicy(ps *PolicyState, now time.Time) *pb.GetControlMetricsResponse {
 	policy := ps.Policy
 	workload := ps.Workload
@@ -469,9 +469,11 @@ func calculatePolicy(ps *PolicyState, now time.Time) *pb.GetControlMetricsRespon
 			rcm[name] = ps.Metrics.calculate(defs.GetDefinitions(), workload, now)
 		}
 	}
+	eligible := int32(len(filterEligiblePods(workload)))
 	return pb.GetControlMetricsResponse_builder{
 		Timestamp:                 timestamppb.New(now),
-		ReadyReplicas:             proto.Int32(readyReplicas(workload)),
+		EligiblePods:              proto.Int32(eligible),
+		IneligiblePods:            proto.Int32(int32(len(workload)) - eligible),
 		ControlMetrics:            cm,
 		RecommenderControlMetrics: rcm,
 	}.Build()

@@ -17,7 +17,7 @@ type config struct {
 	target float64
 }
 
-func (r *LinearRecommender) Recommend(def *pb.RecommenderDefinition, state, _ *pb.ControlMetrics, readyReplicas int32, _ *pb.Workload) *pb.Recommendation {
+func (r *LinearRecommender) Recommend(def *pb.RecommenderDefinition, state, _ *pb.ControlMetrics, eligiblePods int32, _ *pb.Workload) *pb.Recommendation {
 	cfg, err := parseConfig(def)
 	if err != nil {
 		return pb.Recommendation_builder{
@@ -33,7 +33,10 @@ func (r *LinearRecommender) Recommend(def *pb.RecommenderDefinition, state, _ *p
 	}
 
 	ratio := val / cfg.target
-	desired := int32(math.Ceil(float64(readyReplicas) * ratio))
+	// A workload without any eligible pod (e.g. all its pods are still
+	// starting up) is scaled as if it had one, so that the recommendation
+	// never collapses to 0 because of the pods' readiness alone.
+	desired := int32(math.Ceil(float64(max(eligiblePods, 1)) * ratio))
 
 	return pb.Recommendation_builder{
 		Replicas: &desired,

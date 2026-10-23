@@ -28,7 +28,7 @@ type Recommender interface {
 	// number of ready replicas the metrics were calculated against, and the
 	// workload's pods with their current requests (e.g. to only resize the
 	// pods that need it).
-	Recommend(def *pb.RecommenderDefinition, metrics, ownedMetrics *pb.ControlMetrics, readyReplicas int32, workload *pb.Workload) *pb.Recommendation
+	Recommend(def *pb.RecommenderDefinition, metrics, ownedMetrics *pb.ControlMetrics, eligiblePods int32, workload *pb.Workload) *pb.Recommendation
 }
 
 // The VPA recommender owns the metrics the user doesn't configure.
@@ -131,7 +131,7 @@ func (e *Engine) processPolicy(policy *pb.Policy) {
 		}
 		// Recommenders that own no metric have no entry: ownedMetrics is nil.
 		ownedMetrics := metrics.GetRecommenderControlMetrics()[def.GetName()]
-		if v := rec.Recommend(def, metrics.GetControlMetrics(), ownedMetrics, metrics.GetReadyReplicas(), workload); v != nil {
+		if v := rec.Recommend(def, metrics.GetControlMetrics(), ownedMetrics, metrics.GetEligiblePods(), workload); v != nil {
 			recommendations = append(recommendations, namedRecommendation{name: def.GetName(), recommendation: v})
 		}
 	}

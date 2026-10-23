@@ -525,7 +525,8 @@ func TestDump(t *testing.T) {
     },
     "ControlMetrics": {
       "timestamp": "1970-01-01T00:16:40Z",
-      "ready_replicas": 1,
+      "eligible_pods": 1,
+      "ineligible_pods": 0,
       "control_metrics": {
         "values": {
           "cpu": 1
@@ -1212,8 +1213,8 @@ func TestRecommenderOwnedMetrics(t *testing.T) {
 		t.Fatal("GetControlMetrics() not found")
 	}
 	// The workload state is reported once, for all the owners.
-	if res.GetReadyReplicas() != 2 {
-		t.Errorf("GetControlMetrics() ready replicas = %d, want 2", res.GetReadyReplicas())
+	if res.GetEligiblePods() != 2 {
+		t.Errorf("GetControlMetrics() eligible pods = %d, want 2", res.GetEligiblePods())
 	}
 	// Policy-wide metrics are unaffected by the owned ones: Avg(1, 3).
 	if diff := cmp.Diff(map[string]float64{"cpu": 2}, res.GetControlMetrics().GetValues()); diff != "" {

@@ -51,7 +51,7 @@ func (r *workloadRecommender) Recommend(_ *pb.RecommenderDefinition, _, _ *pb.Co
 // recommenderInput is what a recommender instance was given to recommend.
 type recommenderInput struct {
 	metrics, ownedMetrics *pb.ControlMetrics
-	readyReplicas         int32
+	eligiblePods          int32
 }
 
 // metricsRecommender records the metrics given to each recommender instance,
@@ -60,11 +60,11 @@ type metricsRecommender struct {
 	got map[string]recommenderInput
 }
 
-func (r *metricsRecommender) Recommend(def *pb.RecommenderDefinition, metrics, ownedMetrics *pb.ControlMetrics, readyReplicas int32, _ *pb.Workload) *pb.Recommendation {
+func (r *metricsRecommender) Recommend(def *pb.RecommenderDefinition, metrics, ownedMetrics *pb.ControlMetrics, eligiblePods int32, _ *pb.Workload) *pb.Recommendation {
 	if r.got == nil {
 		r.got = make(map[string]recommenderInput)
 	}
-	r.got[def.GetName()] = recommenderInput{metrics: metrics, ownedMetrics: ownedMetrics, readyReplicas: readyReplicas}
+	r.got[def.GetName()] = recommenderInput{metrics: metrics, ownedMetrics: ownedMetrics, eligiblePods: eligiblePods}
 	return nil
 }
 
@@ -76,7 +76,7 @@ func TestProcessPolicyPassesMetrics(t *testing.T) {
 	vpaOwned := pb.ControlMetrics_builder{Values: map[string]float64{"cpu": 30}}.Build()
 	client := &recommendClient{
 		metrics: pb.GetControlMetricsResponse_builder{
-			ReadyReplicas:             proto.Int32(2),
+			EligiblePods:              proto.Int32(2),
 			ControlMetrics:            policyWide,
 			RecommenderControlMetrics: map[string]*pb.ControlMetrics{"vpa": vpaOwned},
 		}.Build(),
@@ -93,8 +93,8 @@ func TestProcessPolicyPassesMetrics(t *testing.T) {
 	e.processPolicy(policy)
 
 	want := map[string]recommenderInput{
-		"act": {metrics: policyWide, ownedMetrics: nil, readyReplicas: 2},
-		"vpa": {metrics: policyWide, ownedMetrics: vpaOwned, readyReplicas: 2},
+		"act": {metrics: policyWide, ownedMetrics: nil, eligiblePods: 2},
+		"vpa": {metrics: policyWide, ownedMetrics: vpaOwned, eligiblePods: 2},
 	}
 	if diff := cmp.Diff(want, rec.got, cmp.AllowUnexported(recommenderInput{}), protocmp.Transform()); diff != "" {
 		t.Errorf("metrics given to Recommend mismatch (-want +got):\n%s", diff)

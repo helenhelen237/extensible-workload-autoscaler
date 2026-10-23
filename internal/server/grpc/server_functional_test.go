@@ -466,8 +466,8 @@ func TestGetControlMetrics_Aggregation(t *testing.T) {
 	res := getControlMetrics(t, ctx, client, id)
 
 	wantRes := pb.GetControlMetricsResponse_builder{
-		Timestamp:     timestamppb.New(time.Unix(ts, 0)),
-		ReadyReplicas: proto.Int32(2),
+		Timestamp:    timestamppb.New(time.Unix(ts, 0)),
+		EligiblePods: proto.Int32(2),
 		ControlMetrics: pb.ControlMetrics_builder{
 			Values: map[string]float64{
 				"g_avg": 20.0, // (10+30)/2
@@ -529,8 +529,8 @@ func TestGetControlMetrics_PodScope(t *testing.T) {
 	res := getControlMetrics(t, ctx, client, id)
 
 	wantRes := pb.GetControlMetricsResponse_builder{
-		Timestamp:     timestamppb.New(time.Unix(ts, 0)),
-		ReadyReplicas: proto.Int32(2),
+		Timestamp:    timestamppb.New(time.Unix(ts, 0)),
+		EligiblePods: proto.Int32(2),
 		ControlMetrics: pb.ControlMetrics_builder{
 			Values: map[string]float64{
 				"cpu_global": 20.0, // Aggregated: (10 + 30) / 2
@@ -591,8 +591,8 @@ func TestGetControlMetrics_PodContainerScope(t *testing.T) {
 	res := getControlMetrics(t, ctx, client, id)
 
 	wantRes := pb.GetControlMetricsResponse_builder{
-		Timestamp:     timestamppb.New(time.Unix(ts, 0)),
-		ReadyReplicas: proto.Int32(2),
+		Timestamp:    timestamppb.New(time.Unix(ts, 0)),
+		EligiblePods: proto.Int32(2),
 		ControlMetrics: pb.ControlMetrics_builder{
 			Values: map[string]float64{},
 			PodMetrics: map[string]*pb.MetricValues{
@@ -662,8 +662,8 @@ func TestGetControlMetrics_ContainerScope(t *testing.T) {
 	res := getControlMetrics(t, ctx, client, id)
 
 	wantRes := pb.GetControlMetricsResponse_builder{
-		Timestamp:     timestamppb.New(time.Unix(ts, 0)),
-		ReadyReplicas: proto.Int32(2),
+		Timestamp:    timestamppb.New(time.Unix(ts, 0)),
+		EligiblePods: proto.Int32(2),
 		ControlMetrics: pb.ControlMetrics_builder{
 			Values: map[string]float64{},
 			ContainerMetrics: pb.ContainerMetrics_builder{
@@ -727,8 +727,8 @@ func TestGetControlMetrics_ContainerScopeAveragesOverReportingPodsOnly(t *testin
 	res := getControlMetrics(t, ctx, client, id)
 
 	wantRes := pb.GetControlMetricsResponse_builder{
-		Timestamp:     timestamppb.New(time.Unix(ts, 0)),
-		ReadyReplicas: proto.Int32(2),
+		Timestamp:    timestamppb.New(time.Unix(ts, 0)),
+		EligiblePods: proto.Int32(2),
 		ControlMetrics: pb.ControlMetrics_builder{
 			Values: map[string]float64{},
 			ContainerMetrics: pb.ContainerMetrics_builder{
@@ -788,8 +788,8 @@ func TestGetControlMetrics_PodScopeOmitsContainerBreakdown(t *testing.T) {
 	res := getControlMetrics(t, ctx, client, id)
 
 	wantRes := pb.GetControlMetricsResponse_builder{
-		Timestamp:     timestamppb.New(time.Unix(ts, 0)),
-		ReadyReplicas: proto.Int32(1),
+		Timestamp:    timestamppb.New(time.Unix(ts, 0)),
+		EligiblePods: proto.Int32(1),
 		ControlMetrics: pb.ControlMetrics_builder{
 			Values: map[string]float64{},
 			PodMetrics: map[string]*pb.MetricValues{
@@ -858,8 +858,9 @@ func TestGetControlMetrics_PodEligibility(t *testing.T) {
 	res := getControlMetrics(t, ctx, client, id)
 
 	wantRes := pb.GetControlMetricsResponse_builder{
-		Timestamp:     timestamppb.New(time.Unix(ts, 0)),
-		ReadyReplicas: proto.Int32(2),
+		Timestamp:      timestamppb.New(time.Unix(ts, 0)),
+		EligiblePods:   proto.Int32(2),
+		IneligiblePods: proto.Int32(3),
 		ControlMetrics: pb.ControlMetrics_builder{
 			Values: map[string]float64{"m1": 30},
 		}.Build(),
@@ -912,8 +913,9 @@ func TestGetControlMetrics_TerminatingPod(t *testing.T) {
 	res := getControlMetrics(t, ctx, client, id)
 
 	wantRes := pb.GetControlMetricsResponse_builder{
-		Timestamp:     timestamppb.New(time.Unix(ts, 0)),
-		ReadyReplicas: proto.Int32(1),
+		Timestamp:      timestamppb.New(time.Unix(ts, 0)),
+		EligiblePods:   proto.Int32(1),
+		IneligiblePods: proto.Int32(1),
 		ControlMetrics: pb.ControlMetrics_builder{
 			Values: map[string]float64{"m1": 10},
 		}.Build(),
@@ -1102,8 +1104,102 @@ func TestGetControlMetrics_StartupSamples(t *testing.T) {
 		t.Errorf("ControlMetrics.Values mismatch (-want +got):\n%s", diff)
 	}
 	// The replica count isn't affected: it is a property of the workload.
-	if res.GetReadyReplicas() != 1 {
-		t.Errorf("ReadyReplicas = %d, want 1", res.GetReadyReplicas())
+	if res.GetEligiblePods() != 1 {
+		t.Errorf("EligiblePods = %d, want 1", res.GetEligiblePods())
+	}
+}
+
+// The Server reports how many pods of the workload are eligible, how many
+// aren't, and per metric reported by the pods, how many eligible pods have no
+// usable sample.
+func TestGetControlMetrics_PodCounts(t *testing.T) {
+	clk := &clock.FakeClock{CurrentTime: time.Unix(10000, 0)}
+	memStore, client, cleanup := setupFunctionalGRPCServer(t, clk)
+	defer cleanup()
+	ctx := context.Background()
+
+	id := pb.PolicyId_builder{ClusterName: proto.String("c1"), Namespace: proto.String("ns"), Name: proto.String("p1")}.Build()
+	client.CreatePolicy(ctx, pb.CreatePolicyRequest_builder{
+		Policy: pb.Policy_builder{
+			Id: id,
+			Metrics: []*pb.MetricDefinition{
+				pb.MetricDefinition_builder{Name: proto.String("m_all"), Gauge: pb.Gauge_builder{Aggregation: proto.String("Sum")}.Build()}.Build(),
+				pb.MetricDefinition_builder{Name: proto.String("m_some"), Gauge: pb.Gauge_builder{Aggregation: proto.String("Sum")}.Build()}.Build(),
+				// Not reported per pod (e.g. an external queue length).
+				pb.MetricDefinition_builder{Name: proto.String("m_external"), Gauge: pb.Gauge_builder{Aggregation: proto.String("Sum")}.Build()}.Build(),
+			},
+		}.Build(),
+	}.Build())
+
+	start := timestamppb.New(time.Unix(1000, 0))
+	at := func(offset time.Duration) *timestamppb.Timestamp {
+		return timestamppb.New(time.Unix(1000, 0).Add(offset))
+	}
+	client.UpdateWorkload(ctx, pb.UpdateWorkloadRequest_builder{
+		Id: id,
+		Workload: pb.Workload_builder{Pods: []*pb.PodState{
+			pb.PodState_builder{Name: proto.String("pod-a"), Phase: proto.String("Running"), StartTime: start, IsReady: proto.Bool(true), ReadyLastTransitionTime: at(10 * time.Second)}.Build(),
+			pb.PodState_builder{Name: proto.String("pod-b"), Phase: proto.String("Running"), StartTime: start, IsReady: proto.Bool(true), ReadyLastTransitionTime: at(10 * time.Second)}.Build(),
+			// Eligible, but reports nothing yet.
+			pb.PodState_builder{Name: proto.String("pod-c"), Phase: proto.String("Running"), StartTime: start, IsReady: proto.Bool(true), ReadyLastTransitionTime: at(10 * time.Second)}.Build(),
+			// Still starting up: not eligible.
+			pb.PodState_builder{Name: proto.String("pod-never-ready"), Phase: proto.String("Running"), StartTime: start, IsReady: proto.Bool(false), ReadyLastTransitionTime: at(time.Second)}.Build(),
+			// Shutting down: not eligible.
+			pb.PodState_builder{Name: proto.String("pod-terminating"), Phase: proto.String("Running"), StartTime: start, IsReady: proto.Bool(true), ReadyLastTransitionTime: at(10 * time.Second), DeletionTimestamp: at(2 * time.Hour)}.Build(),
+		}}.Build(),
+	}.Build())
+
+	sample := func(name string, value float64) *pb.MetricSample {
+		return pb.MetricSample_builder{Name: proto.String(name), Value: proto.Float64(value)}.Build()
+	}
+	ts := clk.Now().Unix()
+	client.IngestMetrics(ctx, pb.IngestMetricsRequest_builder{
+		ClusterName: proto.String("c1"), Timestamp: timestamppb.New(time.Unix(ts, 0)),
+		Policies: []*pb.PolicyBatch{pb.PolicyBatch_builder{
+			Namespace: proto.String("ns"), Name: proto.String("p1"),
+			Batches: []*pb.MetricBatch{
+				pb.MetricBatch_builder{PodName: proto.String("pod-a"), Samples: []*pb.MetricSample{sample("m_all", 1), sample("m_some", 10)}}.Build(),
+				pb.MetricBatch_builder{PodName: proto.String("pod-b"), Samples: []*pb.MetricSample{sample("m_all", 2)}}.Build(),
+				pb.MetricBatch_builder{PodName: proto.String("pod-never-ready"), Samples: []*pb.MetricSample{sample("m_all", 100), sample("m_some", 100)}}.Build(),
+				pb.MetricBatch_builder{Samples: []*pb.MetricSample{sample("m_external", 42)}}.Build(),
+			},
+		}.Build()},
+	}.Build())
+
+	memStore.CalculateAll()
+	res := getControlMetrics(t, ctx, client, id)
+
+	wantRes := pb.GetControlMetricsResponse_builder{
+		Timestamp:      timestamppb.New(time.Unix(ts, 0)),
+		EligiblePods:   proto.Int32(3),
+		IneligiblePods: proto.Int32(2),
+		ControlMetrics: pb.ControlMetrics_builder{
+			// The external metric is reported per eligible pod.
+			Values: map[string]float64{"m_all": 3, "m_some": 10, "m_external": 14},
+			// pod-c reports nothing, pod-b doesn't report m_some. m_external
+			// isn't reported per pod.
+			MissingPods: map[string]int32{"m_all": 1, "m_some": 2},
+		}.Build(),
+	}.Build()
+	if diff := cmp.Diff(wantRes, res, protocmp.Transform(), protocmp.IgnoreDefaultScalars()); diff != "" {
+		t.Errorf("ControlMetrics mismatch (-want +got):\n%s", diff)
+	}
+
+	// Once every pod is gone but the never-ready one, no pod is eligible:
+	// the count is reported as is, not clamped.
+	client.UpdateWorkload(ctx, pb.UpdateWorkloadRequest_builder{
+		Id: id,
+		Workload: pb.Workload_builder{Pods: []*pb.PodState{
+			pb.PodState_builder{Name: proto.String("pod-never-ready"), Phase: proto.String("Running"), StartTime: start, IsReady: proto.Bool(false), ReadyLastTransitionTime: at(time.Second)}.Build(),
+		}}.Build(),
+	}.Build())
+	memStore.CalculateAll()
+	res = getControlMetrics(t, ctx, client, id)
+	if res.GetEligiblePods() != 0 || res.GetIneligiblePods() != 1 {
+		t.Errorf("EligiblePods, IneligiblePods = %d, %d, want 0, 1", res.GetEligiblePods(), res.GetIneligiblePods())
+	}
+	if len(res.GetControlMetrics().GetMissingPods()) != 0 {
+		t.Errorf("MissingPods = %v, want none without eligible pods", res.GetControlMetrics().GetMissingPods())
 	}
 }
 
@@ -1204,8 +1300,17 @@ func TestGetControlMetrics_CPUInitializationPeriod(t *testing.T) {
 			if diff := cmp.Diff(wantValues, res.GetControlMetrics().GetValues()); diff != "" {
 				t.Errorf("ControlMetrics.Values mismatch (-want +got):\n%s", diff)
 			}
-			if res.GetReadyReplicas() != 1 {
-				t.Errorf("ReadyReplicas = %d, want 1", res.GetReadyReplicas())
+			if res.GetEligiblePods() != 1 {
+				t.Errorf("EligiblePods = %d, want 1", res.GetEligiblePods())
+			}
+			// The pod is eligible but its CPU sample isn't usable yet: it
+			// is missing for the CPU metric.
+			wantMissing := map[string]int32{}
+			if !tc.wantCPUReport {
+				wantMissing["cpu"] = 1
+			}
+			if diff := cmp.Diff(wantMissing, res.GetControlMetrics().GetMissingPods(), cmpopts.EquateEmpty()); diff != "" {
+				t.Errorf("ControlMetrics.MissingPods mismatch (-want +got):\n%s", diff)
 			}
 		})
 	}
@@ -1233,8 +1338,8 @@ func TestGetControlMetrics_PolicyUpdate(t *testing.T) {
 	memStore.CalculateAll()
 	res := getControlMetrics(t, ctx, client, id)
 	wantRes1 := pb.GetControlMetricsResponse_builder{
-		Timestamp:     timestamppb.New(time.Unix(ts, 0)),
-		ReadyReplicas: proto.Int32(1),
+		Timestamp:    timestamppb.New(time.Unix(ts, 0)),
+		EligiblePods: proto.Int32(1),
 		ControlMetrics: pb.ControlMetrics_builder{
 			Values: map[string]float64{"m1": 10},
 		}.Build(),
@@ -1259,8 +1364,8 @@ func TestGetControlMetrics_PolicyUpdate(t *testing.T) {
 	res = getControlMetrics(t, ctx, client, id)
 
 	wantRes2 := pb.GetControlMetricsResponse_builder{
-		Timestamp:     timestamppb.New(time.Unix(ts, 0)),
-		ReadyReplicas: proto.Int32(1),
+		Timestamp:    timestamppb.New(time.Unix(ts, 0)),
+		EligiblePods: proto.Int32(1),
 		ControlMetrics: pb.ControlMetrics_builder{
 			Values: map[string]float64{"m2": 20},
 		}.Build(),
@@ -1316,8 +1421,8 @@ func TestGetControlMetrics_SlidingWindow(t *testing.T) {
 	memStore.CalculateAll()
 	res := getControlMetrics(t, ctx, client, id)
 	wantRes1 := pb.GetControlMetricsResponse_builder{
-		Timestamp:     timestamppb.New(time.Unix(ts, 0)),
-		ReadyReplicas: proto.Int32(1),
+		Timestamp:    timestamppb.New(time.Unix(ts, 0)),
+		EligiblePods: proto.Int32(1),
 		ControlMetrics: pb.ControlMetrics_builder{
 			Values: map[string]float64{
 				"m_instant": 20.0,
@@ -1335,8 +1440,8 @@ func TestGetControlMetrics_SlidingWindow(t *testing.T) {
 	memStore.CalculateAll()
 	res = getControlMetrics(t, ctx, client, id)
 	wantRes2 := pb.GetControlMetricsResponse_builder{
-		Timestamp:     timestamppb.New(time.Unix(ts, 0)),
-		ReadyReplicas: proto.Int32(1),
+		Timestamp:    timestamppb.New(time.Unix(ts, 0)),
+		EligiblePods: proto.Int32(1),
 		ControlMetrics: pb.ControlMetrics_builder{
 			Values: map[string]float64{
 				"m_instant": 20.0,
@@ -1395,8 +1500,8 @@ func TestGetControlMetrics_DecayingHistogramWindow(t *testing.T) {
 	res := getControlMetrics(t, ctx, client, id)
 
 	wantRes := pb.GetControlMetricsResponse_builder{
-		Timestamp:     timestamppb.New(time.Unix(ts, 0)),
-		ReadyReplicas: proto.Int32(1),
+		Timestamp:    timestamppb.New(time.Unix(ts, 0)),
+		EligiblePods: proto.Int32(1),
 		ControlMetrics: pb.ControlMetrics_builder{
 			Values: map[string]float64{
 				"m_max": 1.1,
@@ -1986,8 +2091,8 @@ func TestIngestMetrics_Global(t *testing.T) {
 	res := getControlMetrics(t, ctx, client, id)
 
 	wantRes := pb.GetControlMetricsResponse_builder{
-		Timestamp:     timestamppb.New(time.Unix(ts, 0)),
-		ReadyReplicas: proto.Int32(1),
+		Timestamp:    timestamppb.New(time.Unix(ts, 0)),
+		EligiblePods: proto.Int32(1),
 		ControlMetrics: pb.ControlMetrics_builder{
 			Values: map[string]float64{
 				"g_sum": 100,
@@ -2162,8 +2267,8 @@ func TestGetControlMetrics_DecayingHistogramPodChurn(t *testing.T) {
 	res1 := getControlMetrics(t, ctx, client, id)
 
 	wantRes1 := pb.GetControlMetricsResponse_builder{
-		Timestamp:     timestamppb.New(time.Unix(ts0, 0)),
-		ReadyReplicas: proto.Int32(1),
+		Timestamp:    timestamppb.New(time.Unix(ts0, 0)),
+		EligiblePods: proto.Int32(1),
 		ControlMetrics: pb.ControlMetrics_builder{
 			Values: map[string]float64{"cpu": 1.1}, // p100 of bucket 1.0 (size 0.1)
 		}.Build(),
@@ -2195,8 +2300,8 @@ func TestGetControlMetrics_DecayingHistogramPodChurn(t *testing.T) {
 	res2 := getControlMetrics(t, ctx, client, id)
 
 	wantRes2 := pb.GetControlMetricsResponse_builder{
-		Timestamp:     timestamppb.New(time.Unix(ts1, 0)),
-		ReadyReplicas: proto.Int32(1),
+		Timestamp:    timestamppb.New(time.Unix(ts1, 0)),
+		EligiblePods: proto.Int32(1),
 		ControlMetrics: pb.ControlMetrics_builder{
 			Values: map[string]float64{"cpu": 1.1}, // Persistent from pod-1
 		}.Build(),
@@ -2221,8 +2326,8 @@ func TestGetControlMetrics_DecayingHistogramPodChurn(t *testing.T) {
 	res3 := getControlMetrics(t, ctx, client, id)
 
 	wantRes3 := pb.GetControlMetricsResponse_builder{
-		Timestamp:     timestamppb.New(time.Unix(ts2, 0)),
-		ReadyReplicas: proto.Int32(1),
+		Timestamp:    timestamppb.New(time.Unix(ts2, 0)),
+		EligiblePods: proto.Int32(1),
 		ControlMetrics: pb.ControlMetrics_builder{
 			Values: map[string]float64{"cpu": 0.2}, // Now pod-1 has decayed, pod-2 is max
 		}.Build(),
@@ -2286,8 +2391,8 @@ func TestIntent_GaugeAggregation(t *testing.T) {
 	res := getControlMetrics(t, ctx, client, id)
 
 	wantRes := pb.GetControlMetricsResponse_builder{
-		Timestamp:     timestamppb.New(time.Unix(ts, 0)),
-		ReadyReplicas: proto.Int32(2),
+		Timestamp:    timestamppb.New(time.Unix(ts, 0)),
+		EligiblePods: proto.Int32(2),
 		ControlMetrics: pb.ControlMetrics_builder{
 			Values: map[string]float64{
 				"g_avg": 20.0, // (10+30)/2
@@ -2349,8 +2454,8 @@ func TestIntent_RateCalculation(t *testing.T) {
 
 	// Rate = (110 - 100) / 10s = 1.0
 	wantRes := pb.GetControlMetricsResponse_builder{
-		Timestamp:     timestamppb.New(time.Unix(ts, 0)),
-		ReadyReplicas: proto.Int32(1),
+		Timestamp:    timestamppb.New(time.Unix(ts, 0)),
+		EligiblePods: proto.Int32(1),
 		ControlMetrics: pb.ControlMetrics_builder{
 			Values: map[string]float64{"rps": 1.0},
 		}.Build(),
@@ -2406,8 +2511,8 @@ func TestIntent_DistributionPercentile(t *testing.T) {
 	res := getControlMetrics(t, ctx, client, id)
 
 	wantRes := pb.GetControlMetricsResponse_builder{
-		Timestamp:     timestamppb.New(time.Unix(ts, 0)),
-		ReadyReplicas: proto.Int32(1),
+		Timestamp:    timestamppb.New(time.Unix(ts, 0)),
+		EligiblePods: proto.Int32(1),
 		ControlMetrics: pb.ControlMetrics_builder{
 			Values: map[string]float64{"latency": 1.0},
 		}.Build(),
@@ -2567,8 +2672,8 @@ func TestIntent_PodScope_Gauge(t *testing.T) {
 	res := getControlMetrics(t, ctx, client, id)
 
 	wantRes := pb.GetControlMetricsResponse_builder{
-		Timestamp:     timestamppb.New(time.Unix(ts, 0)),
-		ReadyReplicas: proto.Int32(2),
+		Timestamp:    timestamppb.New(time.Unix(ts, 0)),
+		EligiblePods: proto.Int32(2),
 		ControlMetrics: pb.ControlMetrics_builder{
 			Values: map[string]float64{},
 			PodMetrics: map[string]*pb.MetricValues{
@@ -2619,8 +2724,8 @@ func TestIntent_PodScope_Rate(t *testing.T) {
 	res := getControlMetrics(t, ctx, client, id)
 
 	wantRes := pb.GetControlMetricsResponse_builder{
-		Timestamp:     timestamppb.New(time.Unix(ts, 0)),
-		ReadyReplicas: proto.Int32(1),
+		Timestamp:    timestamppb.New(time.Unix(ts, 0)),
+		EligiblePods: proto.Int32(1),
 		ControlMetrics: pb.ControlMetrics_builder{
 			Values: map[string]float64{},
 			PodMetrics: map[string]*pb.MetricValues{
@@ -2670,8 +2775,8 @@ func TestIntent_PodScope_Distribution(t *testing.T) {
 	res := getControlMetrics(t, ctx, client, id)
 
 	wantRes := pb.GetControlMetricsResponse_builder{
-		Timestamp:     timestamppb.New(time.Unix(ts, 0)),
-		ReadyReplicas: proto.Int32(1),
+		Timestamp:    timestamppb.New(time.Unix(ts, 0)),
+		EligiblePods: proto.Int32(1),
 		ControlMetrics: pb.ControlMetrics_builder{
 			Values: map[string]float64{},
 			PodMetrics: map[string]*pb.MetricValues{
@@ -2717,8 +2822,8 @@ func TestIntent_PodScope_DecayingDistribution(t *testing.T) {
 	res := getControlMetrics(t, ctx, client, id)
 
 	wantRes := pb.GetControlMetricsResponse_builder{
-		Timestamp:     timestamppb.New(time.Unix(ts, 0)),
-		ReadyReplicas: proto.Int32(1),
+		Timestamp:    timestamppb.New(time.Unix(ts, 0)),
+		EligiblePods: proto.Int32(1),
 		ControlMetrics: pb.ControlMetrics_builder{
 			Values: map[string]float64{},
 			PodMetrics: map[string]*pb.MetricValues{

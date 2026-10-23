@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"iter"
 	"maps"
+	"slices"
 	"time"
 
 	"google.golang.org/protobuf/proto"
@@ -39,6 +40,17 @@ func newMetricSeries(def *pb.MetricDefinition, podName, containerName string, sa
 
 func (ms *MetricSeries) isEmpty() bool {
 	return ms == nil || len(ms.Series) == 0
+}
+
+// isPerPod reports whether the metric is reported by the pods, as opposed to
+// e.g. an external metric such as a queue length.
+func (ms *MetricSeries) isPerPod() bool {
+	for _, ser := range ms.Series {
+		if ser.PodName != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func (ms *MetricSeries) getSeries(sid model.SeriesID) (*model.Series, bool) {
@@ -206,8 +218,10 @@ func definedMetrics(policy *pb.Policy) map[metricID]*pb.MetricDefinition {
 func (ms *MetricStore) calculate(defs []*pb.MetricDefinition, workload map[string]*pb.PodState, now time.Time) *pb.ControlMetrics {
 	ms.gcSeries(now)
 
+	eligiblePods := filterEligiblePods(workload)
 	cm := pb.ControlMetrics_builder{
 		Values:              make(map[string]float64),
+		MissingPods:         make(map[string]int32),
 		PodMetrics:          make(map[string]*pb.MetricValues),
 		PodContainerMetrics: make(map[string]*pb.ContainerMetrics),
 		ContainerMetrics: pb.ContainerMetrics_builder{
@@ -224,7 +238,13 @@ func (ms *MetricStore) calculate(defs []*pb.MetricDefinition, workload map[strin
 		if !def.GetEligibility().GetStartupSamples() {
 			series = filterInitializingCPU(series, workload, now)
 		}
-		aggregation.AddControlMetric(cm, def.GetName(), metricSeries.Aggregation.Reduce(series, workload))
+		usable := slices.Collect(series)
+		if metricSeries.isPerPod() {
+			if missing := missingPods(usable, eligiblePods); missing > 0 {
+				cm.GetMissingPods()[def.GetName()] = int32(missing)
+			}
+		}
+		aggregation.AddControlMetric(cm, def.GetName(), metricSeries.Aggregation.Reduce(slices.Values(usable), workload))
 	}
 
 	// Skip empty ContainerMetrics as, unlike empty maps, an empty proto message
@@ -268,16 +288,30 @@ func filterInitializingCPU(series iter.Seq[*model.Series], workload map[string]*
 	}
 }
 
-// readyReplicas returns the number of pods of the workload whose metrics are
-// considered (see podutil.IsEligible), as reported to the recommenders. At
-// least 1 is reported, so that a recommender scaling the current replicas
-// proportionally (e.g. Linear) does not get stuck at 0.
-func readyReplicas(workload map[string]*pb.PodState) int32 {
-	n := 0
-	for _, p := range workload {
+// filterEligiblePods returns the pods of the workload whose metrics should be
+// considered, keyed by name. See podutil.IsEligible.
+func filterEligiblePods(workload map[string]*pb.PodState) map[string]*pb.PodState {
+	eligible := make(map[string]*pb.PodState, len(workload))
+	for name, p := range workload {
 		if podutil.IsEligible(podutil.FromPodState(p)) {
-			n++
+			eligible[name] = p
 		}
 	}
-	return int32(max(1, n))
+	return eligible
+}
+
+// missingPods returns the number of eligible pods without a series among the
+// given ones, i.e. without a usable sample.
+func missingPods(series []*model.Series, eligiblePods map[string]*pb.PodState) int {
+	reporting := make(map[string]bool)
+	for _, ser := range series {
+		reporting[ser.PodName] = true
+	}
+	missing := 0
+	for name := range eligiblePods {
+		if !reporting[name] {
+			missing++
+		}
+	}
+	return missing
 }
