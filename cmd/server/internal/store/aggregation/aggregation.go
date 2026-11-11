@@ -555,6 +555,9 @@ func NewDecayingDistributionAggregation(def *pb.DecayingDistribution, typ model.
 }
 
 func (d *DecayingDistributionAggregation) AddSample(sample model.Sample) {
+	if d.histogram == nil {
+		return
+	}
 	if d.rate != nil {
 		d.rate.AddSample(sample)
 		rate, ok := d.rate.Apply()

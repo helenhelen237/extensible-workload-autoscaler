@@ -1,6 +1,9 @@
 package grpc
 
 import (
+	"math"
+	"strconv"
+
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -105,8 +108,12 @@ func validateMetricDefinition(m *pb.MetricDefinition) error {
 		if m.GetDecayingDistribution().GetHalfLife().AsDuration() <= 0 {
 			return status.Errorf(codes.InvalidArgument, "metric %s: a positive half_life is required for decaying_distribution intent", m.GetName())
 		}
-		if m.GetDecayingDistribution().GetBucketSize() == "" {
+		bucketSizeStr := m.GetDecayingDistribution().GetBucketSize()
+		if bucketSizeStr == "" {
 			return status.Errorf(codes.InvalidArgument, "metric %s: bucket_size is required for decaying_distribution intent", m.GetName())
+		}
+		if bucketSize, err := strconv.ParseFloat(bucketSizeStr, 64); err != nil || math.IsNaN(bucketSize) || math.IsInf(bucketSize, 0) || bucketSize <= 0 {
+			return status.Errorf(codes.InvalidArgument, "metric %s: a positive finite bucket_size is required for decaying_distribution intent", m.GetName())
 		}
 		if m.GetDecayingDistribution().GetPercentile() == "" {
 			return status.Errorf(codes.InvalidArgument, "metric %s: percentile is required for decaying_distribution intent", m.GetName())

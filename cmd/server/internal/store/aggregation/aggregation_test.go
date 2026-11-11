@@ -138,3 +138,36 @@ func TestNewDecayingDistributionAggregation_NoRate(t *testing.T) {
 		t.Errorf("got a rate window without a rate configured")
 	}
 }
+
+func TestDecayingDistributionAggregation_InvalidBucketSizeDoesNotPanic(t *testing.T) {
+	for _, bucketSize := range []string{"invalid", "100Mi", "0", "-1", "NaN", "+Inf"} {
+		t.Run("gauge/"+bucketSize, func(t *testing.T) {
+			def := pb.DecayingDistribution_builder{
+				HalfLife:   durationpb.New(time.Hour),
+				BucketSize: new(bucketSize),
+				Percentile: new("p95"),
+			}.Build()
+			d := NewDecayingDistributionAggregation(def, model.SampleTypeGauge)
+			add(d, t0, 10)
+			add(d, at(10*time.Second), 20)
+			if _, ok := d.Apply(); ok {
+				t.Errorf("Apply() reported a value for invalid bucket size %q", bucketSize)
+			}
+		})
+
+		t.Run("rate/"+bucketSize, func(t *testing.T) {
+			def := pb.DecayingDistribution_builder{
+				HalfLife:   durationpb.New(time.Hour),
+				BucketSize: new(bucketSize),
+				Percentile: new("p95"),
+				Rate:       durationpb.New(0),
+			}.Build()
+			d := NewDecayingDistributionAggregation(def, model.SampleTypeCounter)
+			add(d, t0, 0)
+			add(d, at(10*time.Second), 100)
+			if _, ok := d.Apply(); ok {
+				t.Errorf("Apply() reported a value for invalid bucket size %q", bucketSize)
+			}
+		})
+	}
+}

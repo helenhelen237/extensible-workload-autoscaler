@@ -542,3 +542,31 @@ func TestIngest_SharedDecayingDistributionRepeats(t *testing.T) {
 		t.Errorf("after re-reports: TotalWeight = %v, want %v", got, want)
 	}
 }
+
+func TestIngest_InvalidDecayingDistributionBucketSize(t *testing.T) {
+	for _, scope := range []string{"", model.ScopePod} {
+		policy := pb.Policy_builder{Metrics: []*pb.MetricDefinition{pb.MetricDefinition_builder{
+			Name:  new("cpu"),
+			Scope: new(scope),
+			DecayingDistribution: pb.DecayingDistribution_builder{
+				HalfLife:   durationpb.New(time.Hour),
+				BucketSize: new("invalid"),
+				Percentile: new("p95"),
+			}.Build(),
+		}.Build()}}.Build()
+
+		ms := NewMetricStore()
+		workload := readyPods("pod-a", "pod-b")
+		batches := []*pb.MetricBatch{
+			pb.MetricBatch_builder{PodName: new("pod-a"), Samples: []*pb.MetricSample{newSample("cpu", t0, 1)}}.Build(),
+			pb.MetricBatch_builder{PodName: new("pod-b"), Samples: []*pb.MetricSample{newSample("cpu", t0, 2)}}.Build(),
+		}
+		if err := ms.IngestMetrics(policy, workload, batches, t0); err != nil {
+			t.Fatalf("scope %q: IngestMetrics() = %v", scope, err)
+		}
+		cm := ms.calculate(policy.GetMetrics(), workload, t0)
+		if len(cm.GetValues()) != 0 || len(cm.GetPodMetrics()) != 0 {
+			t.Errorf("scope %q: calculate() = %v, want no values for invalid bucket size", scope, cm)
+		}
+	}
+}

@@ -127,6 +127,47 @@ func TestUpdatePolicy_Validation(t *testing.T) {
 			t.Errorf("Expected InvalidArgument for %s, got %v", name, err)
 		}
 	}
+
+	for _, bucketSize := range []string{"", "invalid", "100Mi", "0", "0.0", "-1", "NaN", "+Inf", "-Inf"} {
+		policy := pb.Policy_builder{
+			Id: id,
+			Metrics: []*pb.MetricDefinition{pb.MetricDefinition_builder{
+				Name: new("m1"),
+				DecayingDistribution: pb.DecayingDistribution_builder{
+					HalfLife:   durationpb.New(time.Hour),
+					BucketSize: new(bucketSize),
+					Percentile: new("p95"),
+				}.Build(),
+			}.Build()},
+		}.Build()
+
+		if _, err = client.CreatePolicy(ctx, pb.CreatePolicyRequest_builder{Policy: policy}.Build()); status.Code(err) != codes.InvalidArgument {
+			t.Errorf("CreatePolicy(bucket_size=%q) code = %v, want InvalidArgument", bucketSize, status.Code(err))
+		}
+		if _, err = client.UpdatePolicy(ctx, pb.UpdatePolicyRequest_builder{Policy: policy, AllowMissing: new(true)}.Build()); status.Code(err) != codes.InvalidArgument {
+			t.Errorf("UpdatePolicy(bucket_size=%q) code = %v, want InvalidArgument", bucketSize, status.Code(err))
+		}
+
+		ownedPolicy := pb.Policy_builder{
+			Id: id,
+			RecommenderMetrics: map[string]*pb.MetricDefinitionList{
+				"vpa": pb.MetricDefinitionList_builder{
+					Definitions: []*pb.MetricDefinition{pb.MetricDefinition_builder{
+						Name:            new("m1"),
+						RecommenderName: new("vpa"),
+						DecayingDistribution: pb.DecayingDistribution_builder{
+							HalfLife:   durationpb.New(time.Hour),
+							BucketSize: new(bucketSize),
+							Percentile: new("p95"),
+						}.Build(),
+					}.Build()},
+				}.Build(),
+			},
+		}.Build()
+		if _, err = client.UpdatePolicy(ctx, pb.UpdatePolicyRequest_builder{Policy: ownedPolicy, AllowMissing: new(true)}.Build()); status.Code(err) != codes.InvalidArgument {
+			t.Errorf("UpdatePolicy(owned bucket_size=%q) code = %v, want InvalidArgument", bucketSize, status.Code(err))
+		}
+	}
 }
 
 func TestUpdatePolicy_CrossCluster(t *testing.T) {

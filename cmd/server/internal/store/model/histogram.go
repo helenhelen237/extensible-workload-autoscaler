@@ -27,8 +27,8 @@ func NewDecayingHistogram(now time.Time, halfLife time.Duration, bucketSizeStr s
 	// Parse bucket size (supports "0.1", "100Mi", etc.)
 	// For now, simple float parsing. TODO: Add resource quantity parsing.
 	bucketSize, err := strconv.ParseFloat(bucketSizeStr, 64)
-	if err != nil {
-		return nil, fmt.Errorf("invalid bucket size: %v", err)
+	if err != nil || math.IsNaN(bucketSize) || math.IsInf(bucketSize, 0) || bucketSize <= 0 {
+		return nil, fmt.Errorf("invalid bucket size %q: must be a positive finite number", bucketSizeStr)
 	}
 
 	return &DecayingHistogram{
