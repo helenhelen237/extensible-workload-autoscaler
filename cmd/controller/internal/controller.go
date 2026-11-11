@@ -9,6 +9,7 @@ import (
 	"time"
 
 	autoscalingv1 "k8s.io/api/autoscaling/v1"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -229,7 +230,7 @@ func (c *Controller) handleRecommendation(resp *pb.ArbitratedRecommendationsEven
 // scaleTargetResource resolves a policy's scaleTargetRef (apiVersion + kind)
 // to the GroupResource expected by the scale client, using API discovery.
 // An empty apiVersion defaults to apps/v1 for backward compatibility.
-func (c *Controller) scaleTargetResource(ref xasv1.CrossVersionObjectReference) (schema.GroupResource, error) {
+func (c *Controller) scaleTargetResource(ref autoscalingv2.CrossVersionObjectReference) (schema.GroupResource, error) {
 	apiVersion := ref.APIVersion
 	if apiVersion == "" {
 		apiVersion = "apps/v1"
@@ -474,7 +475,7 @@ func (c *Controller) updateStatus(policy *xasv1.ScalingPolicy, scale *autoscalin
 	} else {
 		policyCopy.Status.DesiredReplicas = scale.Spec.Replicas
 	}
-	policyCopy.Status.LastUpdated = time.Now().Format(time.RFC3339)
+	policyCopy.Status.LastUpdated = metav1.Now()
 	policyCopy.Status.Selector = selector
 
 	policyCopy.Status.Recommendations = make([]xasv1.RecommendationStatus, len(resp.GetExplanation()))
@@ -484,11 +485,7 @@ func (c *Controller) updateStatus(policy *xasv1.ScalingPolicy, scale *autoscalin
 			if wr == nil {
 				continue
 			}
-			wrr = append(wrr, xasv1.ResourceRecommendation{
-				ContainerName: wr.GetContainerName(),
-				Requests:      wr.GetRequests(),
-				Limits:        wr.GetLimits(),
-			})
+			wrr = append(wrr, resourceRecommendation(wr))
 		}
 
 		var prr []xasv1.PodResourceRecommendation
@@ -498,11 +495,8 @@ func (c *Controller) updateStatus(policy *xasv1.ScalingPolicy, scale *autoscalin
 			}
 			rec := xasv1.PodResourceRecommendation{PodName: pr.GetPodName()}
 			if cr := pr.GetContainerResources(); cr != nil {
-				rec.Resources = &xasv1.ResourceRecommendation{
-					ContainerName: cr.GetContainerName(),
-					Requests:      cr.GetRequests(),
-					Limits:        cr.GetLimits(),
-				}
+				rr := resourceRecommendation(cr)
+				rec.Resources = &rr
 			}
 			prr = append(prr, rec)
 		}
@@ -524,7 +518,7 @@ func (c *Controller) updateStatus(policy *xasv1.ScalingPolicy, scale *autoscalin
 	for i, ms := range resp.GetMetricStatuses() {
 		policyCopy.Status.MetricStatuses[i] = xasv1.MetricStatus{
 			Name:        ms.GetName(),
-			LastUpdated: ms.GetTimestamp().AsTime().Format(time.RFC3339),
+			LastUpdated: metav1.NewTime(ms.GetTimestamp().AsTime()),
 			Value:       fmt.Sprintf("%g", ms.GetValue()),
 			Error:       ms.GetError(),
 		}
@@ -760,6 +754,24 @@ func buildContainerStates(pod *corev1.Pod) []*pb.ContainerState {
 		containers = append(containers, state)
 	}
 	return containers
+}
+
+// resourceRecommendation converts a gRPC ContainerResource into the CRD
+// ResourceRecommendation, omitting unparseable or empty resource maps.
+func resourceRecommendation(cr *pb.ContainerResource) xasv1.ResourceRecommendation {
+	reqs := parseResourceList(cr.GetRequests())
+	if len(reqs) == 0 {
+		reqs = nil
+	}
+	lims := parseResourceList(cr.GetLimits())
+	if len(lims) == 0 {
+		lims = nil
+	}
+	return xasv1.ResourceRecommendation{
+		ContainerName: cr.GetContainerName(),
+		Requests:      reqs,
+		Limits:        lims,
+	}
 }
 
 // resourceListStrings returns the quantities of the list as strings, or nil

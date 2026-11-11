@@ -1,6 +1,8 @@
 package v1
 
 import (
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -14,7 +16,7 @@ type ScalingPolicy struct {
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
 	Spec   ScalingPolicySpec   `json:"spec,omitempty"`
-	Status ScalingPolicyStatus `json:"status,omitempty"`
+	Status ScalingPolicyStatus `json:"status,omitempty,omitzero"`
 }
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
@@ -28,8 +30,9 @@ type ScalingPolicyList struct {
 
 // ScalingPolicySpec defines the desired state of ScalingPolicy
 type ScalingPolicySpec struct {
-	// ScaleTargetRef points to the target resource to scale
-	ScaleTargetRef CrossVersionObjectReference `json:"scaleTargetRef"`
+	// ScaleTargetRef points to the target resource to scale.
+	// The target resource MUST implement the /scale subresource (e.g. Deployment, StatefulSet, ReplicaSet).
+	ScaleTargetRef autoscalingv2.CrossVersionObjectReference `json:"scaleTargetRef"`
 
 	// MinReplicas is the lower limit for the number of replicas
 	MinReplicas *int32 `json:"minReplicas,omitempty"`
@@ -72,19 +75,6 @@ type RecommenderDefinition struct {
 
 	// Params overrides the configuration from the RecommenderClass.
 	Params map[string]string `json:"params,omitempty"`
-}
-
-// CrossVersionObjectReference contains enough information to let you identify the referred resource.
-// The target resource MUST implement the /scale subresource (e.g. Deployment, StatefulSet, ReplicaSet).
-type CrossVersionObjectReference struct {
-	// Kind of the referent; e.g. Deployment, StatefulSet
-	Kind string `json:"kind"`
-
-	// Name of the referent; e.g. my-app
-	Name string `json:"name"`
-
-	// APIVersion of the referent; e.g. apps/v1
-	APIVersion string `json:"apiVersion,omitempty"`
 }
 
 // MetricDefinition defines how to transform raw scraped data into a single control metric value
@@ -193,8 +183,8 @@ type ScalingPolicyStatus struct {
 	// Used by Agents to identify pods.
 	Selector string `json:"selector,omitempty"`
 
-	// LastUpdated is the timestamp of the last recommendation calculation (ISO8601).
-	LastUpdated string `json:"lastUpdated"` // ISO8601
+	// LastUpdated is the timestamp of the last recommendation calculation.
+	LastUpdated metav1.Time `json:"lastUpdated"`
 
 	// Recommendations lists the latest recommendation of each recommender.
 	Recommendations []RecommendationStatus `json:"recommendations,omitempty"`
@@ -204,10 +194,10 @@ type ScalingPolicyStatus struct {
 }
 
 type MetricStatus struct {
-	Name        string `json:"name"`
-	LastUpdated string `json:"lastUpdated"` // ISO8601
-	Value       string `json:"value"`       // Float as string
-	Error       string `json:"error,omitempty"`
+	Name        string      `json:"name"`
+	LastUpdated metav1.Time `json:"lastUpdated"`
+	Value       string      `json:"value"` // Float as string
+	Error       string      `json:"error,omitempty"`
 }
 
 type RecommendationStatus struct {
@@ -228,9 +218,9 @@ type RecommendationStatus struct {
 type ResourceRecommendation struct {
 	// ContainerName is the container this recommendation applies to.
 	// Empty means the recommendation applies at the pod level.
-	ContainerName string            `json:"containerName,omitempty"`
-	Requests      map[string]string `json:"requests,omitempty"`
-	Limits        map[string]string `json:"limits,omitempty"`
+	ContainerName string              `json:"containerName,omitempty"`
+	Requests      corev1.ResourceList `json:"requests,omitempty"`
+	Limits        corev1.ResourceList `json:"limits,omitempty"`
 }
 
 // PodResourceRecommendation targets a specific pod.
