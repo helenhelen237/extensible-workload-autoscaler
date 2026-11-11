@@ -32,6 +32,36 @@ func TestNewDecayingHistogram(t *testing.T) {
 			wantError:  true,
 		},
 		{
+			name:       "Invalid bucket size (Kubernetes quantity suffix)",
+			bucketSize: "100Mi",
+			wantError:  true,
+		},
+		{
+			name:       "Zero bucket size",
+			bucketSize: "0",
+			wantError:  true,
+		},
+		{
+			name:       "Negative bucket size",
+			bucketSize: "-0.5",
+			wantError:  true,
+		},
+		{
+			name:       "NaN bucket size",
+			bucketSize: "NaN",
+			wantError:  true,
+		},
+		{
+			name:       "Positive infinity bucket size",
+			bucketSize: "+Inf",
+			wantError:  true,
+		},
+		{
+			name:       "Negative infinity bucket size",
+			bucketSize: "-Inf",
+			wantError:  true,
+		},
+		{
 			name:         "Valid integer string",
 			bucketSize:   "10",
 			wantError:    false,
@@ -318,16 +348,8 @@ func TestDecayingHistogram_EdgeCases(t *testing.T) {
 	halfLife := 10 * time.Second
 
 	t.Run("Zero Bucket Size", func(t *testing.T) {
-		_, err := NewDecayingHistogram(start, halfLife, "0.0")
-		// Division by zero would happen on Add.
-		// We expect New to allow it (it just parses float), but Add behavior is interesting.
-		// Actually, math.Floor(x / 0) -> +Inf. int(+Inf) is undefined/max int.
-		// Let's see if we should protect against this in New.
-		// The current implementation allows it.
-		// Let's create one and see what happens (safely).
-		// Actually, let's skip crashing the test runner if it panics, but Go shouldn't panic on div by zero float.
-		if err != nil {
-			t.Log("New rejected 0.0 bucket size")
+		if _, err := NewDecayingHistogram(start, halfLife, "0.0"); err == nil {
+			t.Errorf("NewDecayingHistogram() accepted 0.0 bucket size, want error")
 		}
 	})
 
