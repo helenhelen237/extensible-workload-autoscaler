@@ -11,6 +11,7 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/testing/protocmp"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/cache"
 
@@ -71,7 +72,7 @@ func TestPushPolicy(t *testing.T) {
 	sp := &xasv1.ScalingPolicy{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "prod", Name: "web"},
 		Spec: xasv1.ScalingPolicySpec{
-			ScaleTargetRef: xasv1.CrossVersionObjectReference{Kind: "Deployment", Name: "web", APIVersion: "apps/v1"},
+			ScaleTargetRef: autoscalingv2.CrossVersionObjectReference{Kind: "Deployment", Name: "web", APIVersion: "apps/v1"},
 			MinReplicas:    &minReplicas,
 			MaxReplicas:    10,
 			Scaling:        []xasv1.RecommenderDefinition{{Name: "linear", Recommender: "linear-class"}},
@@ -215,7 +216,7 @@ func TestPushPolicyRemovedRecommenderOwnedMetrics(t *testing.T) {
 	sp := &xasv1.ScalingPolicy{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "prod", Name: "web"},
 		Spec: xasv1.ScalingPolicySpec{
-			ScaleTargetRef: xasv1.CrossVersionObjectReference{Kind: "Deployment", Name: "web", APIVersion: "apps/v1"},
+			ScaleTargetRef: autoscalingv2.CrossVersionObjectReference{Kind: "Deployment", Name: "web", APIVersion: "apps/v1"},
 			MaxReplicas:    10,
 			Scaling:        []xasv1.RecommenderDefinition{{Name: "linear", Recommender: "linear-class"}},
 		},
