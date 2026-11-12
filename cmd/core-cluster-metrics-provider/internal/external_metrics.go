@@ -58,7 +58,7 @@ func (p *CoreClusterMetricsProvider) processExternalMetric(namespace string, m *
 	for _, item := range metricList.Items {
 		val := item.Value.AsApproximateFloat64()
 		ts := item.Timestamp.Unix()
-		if ts == 0 {
+		if item.Timestamp.IsZero() {
 			ts = time.Now().Unix()
 		}
 
