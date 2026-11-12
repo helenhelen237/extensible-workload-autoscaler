@@ -625,6 +625,43 @@ const pageTemplate = `
                 '</div>';
         }
 
+        // podMetricValue returns the formatted metric value for podName, preferring
+        // aggregated per-pod values from ControlMetrics and falling back to the
+        // latest raw scalar sample in Metrics.Series (e.g. for Global-scoped metrics).
+        function podMetricValue(ps, podName, m) {
+            const podValues = m.cm && m.cm.pod_metrics && m.cm.pod_metrics[podName] && m.cm.pod_metrics[podName].values;
+            if (podValues && podValues[m.name] !== undefined) {
+                return formatFloat(podValues[m.name]);
+            }
+
+            const containerMetrics = m.cm && m.cm.pod_container_metrics && m.cm.pod_container_metrics[podName] && m.cm.pod_container_metrics[podName].container_metrics;
+            if (containerMetrics) {
+                const parts = [];
+                for (const containerName of Object.keys(containerMetrics).sort()) {
+                    const containerValues = containerMetrics[containerName] && containerMetrics[containerName].values;
+                    if (containerValues && containerValues[m.name] !== undefined) {
+                        parts.push(containerName + ': ' + formatFloat(containerValues[m.name]));
+                    }
+                }
+                if (parts.length > 0) {
+                    return parts.join(', ');
+                }
+            }
+
+            const metric = ps.Metrics && ps.Metrics.Series && ps.Metrics.Series[m.key];
+            if (metric && metric.Series) {
+                for (const series of Object.values(metric.Series)) {
+                    // Note: Internal structs (Series) use Capitalized fields.
+                    // Histogram series carry bucket counts in Distribution rather than a scalar Value.
+                    if (series && series.PodName === podName && series.Type !== 'Histogram' && series.LastRaw && series.LastRaw.Value !== undefined) {
+                        return formatFloat(series.LastRaw.Value);
+                    }
+                }
+            }
+
+            return '-';
+        }
+
         function renderWorkloadTable(ps) {
             const pods = ps.Workload ? Object.values(ps.Workload).sort((a, b) => a.name.localeCompare(b.name)) : [];
 
@@ -638,6 +675,7 @@ const pageTemplate = `
                         name: m.name,
                         owner: owner.name,
                         key: owner.name ? owner.name + '/' + m.name : m.name,
+                        cm: owner.cm,
                     });
                 });
             });
@@ -657,23 +695,12 @@ const pageTemplate = `
                     
                     let metricCells = '';
                     metrics.forEach(m => {
-                         let val = '-';
-                         const metric = ps.Metrics && ps.Metrics.Series && ps.Metrics.Series[m.key];
-                         if (metric && metric.Series) {
-                             for (const series of Object.values(metric.Series)) {
-                                 // Note: Internal structs (Series) use Capitalized fields
-                                 if (series.PodName === pod.name) {
-                                     val = formatFloat(series.ControlMetric.Value);
-                                     break;
-                                 }
-                             }
-                         }
-                         metricCells += '<td>' + val + '</td>';
+                         metricCells += '<td>' + podMetricValue(ps, pod.name, m) + '</td>';
                     });
 
                     rows += '<tr>' +
                             '<td>' + pod.name + '</td>' +
-                            '<td><span style="font-family: monospace; font-size: 0.85em;">' + pod.node_name + '</span></td>' +
+                            '<td><span style="font-family: monospace; font-size: 0.85em;">' + (pod.node_name || '-') + '</span></td>' +
                             '<td><span class="tag ' + statusClass + '">' + statusText + '</span></td>' +
                             metricCells +
                         '</tr>';
@@ -728,7 +755,7 @@ const pageTemplate = `
         }
 
         function formatFloat(val) {
-             if (val === undefined || val === null) return '-';
+             if (typeof val !== 'number' || !Number.isFinite(val)) return '-';
              return parseFloat(val.toFixed(2));
         }
 

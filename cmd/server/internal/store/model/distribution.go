@@ -2,6 +2,7 @@ package model
 
 import (
 	"cmp"
+	"maps"
 	"math"
 	"slices"
 	"strconv"
@@ -14,6 +15,14 @@ import (
 // Buckets are keyed by their upper bound ("le"), "+Inf" being the last one.
 type Distribution struct {
 	Buckets map[string]float64
+}
+
+// Clone returns a deep copy of d.
+func (d *Distribution) Clone() *Distribution {
+	if d == nil {
+		return nil
+	}
+	return &Distribution{Buckets: maps.Clone(d.Buckets)}
 }
 
 // NewDistribution returns an empty distribution.

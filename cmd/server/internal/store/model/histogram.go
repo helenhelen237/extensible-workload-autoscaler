@@ -2,6 +2,7 @@ package model
 
 import (
 	"fmt"
+	"maps"
 	"math"
 	"sort"
 	"strconv"
@@ -20,6 +21,20 @@ type DecayingHistogram struct {
 	ReferenceTime time.Time
 	// Total weighted count
 	TotalWeight float64
+}
+
+// Clone returns a deep copy of h.
+func (h *DecayingHistogram) Clone() *DecayingHistogram {
+	if h == nil {
+		return nil
+	}
+	return &DecayingHistogram{
+		HalfLife:      h.HalfLife,
+		BucketSize:    h.BucketSize,
+		Buckets:       maps.Clone(h.Buckets),
+		ReferenceTime: h.ReferenceTime,
+		TotalWeight:   h.TotalWeight,
+	}
 }
 
 // NewDecayingHistogram creates a new decaying histogram.
