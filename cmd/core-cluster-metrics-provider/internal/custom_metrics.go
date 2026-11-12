@@ -106,7 +106,7 @@ func (p *CoreClusterMetricsProvider) processCustomMetric(
 		for _, item := range metricList.Items {
 			val := item.Value.AsApproximateFloat64()
 			ts := item.Timestamp.Unix()
-			if ts == 0 {
+			if item.Timestamp.IsZero() {
 				ts = time.Now().Unix()
 			}
 
@@ -141,7 +141,7 @@ func (p *CoreClusterMetricsProvider) processCustomMetric(
 
 	val := item.Value.AsApproximateFloat64()
 	ts := item.Timestamp.Unix()
-	if ts == 0 {
+	if item.Timestamp.IsZero() {
 		ts = time.Now().Unix()
 	}
 
@@ -150,9 +150,10 @@ func (p *CoreClusterMetricsProvider) processCustomMetric(
 			PodName: new(""),
 			Samples: []*pb.MetricSample{
 				pb.MetricSample_builder{
-					Name:      new(m.GetName()),
-					Gauge:     new(val),
-					Timestamp: timestamppb.New(time.Unix(ts, 0)),
+					Name:            new(m.GetName()),
+					RecommenderName: new(m.GetRecommenderName()),
+					Gauge:           new(val),
+					Timestamp:       timestamppb.New(time.Unix(ts, 0)),
 				}.Build(),
 			},
 		}.Build(),

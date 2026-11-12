@@ -84,6 +84,41 @@ func TestProcessExternalMetric(t *testing.T) {
 			},
 		},
 		{
+			name:      "Recommender-Owned External Metric Query",
+			namespace: "default",
+			def: pb.MetricDefinition_builder{
+				Name:            new("queue_depth"),
+				RecommenderName: new("queue-scaler"),
+				Provider:        new("k8s-external-metrics"),
+				Params: map[string]string{
+					"metric":   "pubsub_messages",
+					"selector": "sub=task-sub",
+				},
+			}.Build(),
+			items: []externalv1beta1.ExternalMetricValue{
+				{
+					MetricName:   "pubsub_messages",
+					MetricLabels: map[string]string{"sub": "task-sub"},
+					Timestamp:    metav1.Time{Time: now},
+					Value:        *resource.NewQuantity(150, resource.DecimalSI),
+				},
+			},
+			want: []*pb.MetricBatch{
+				pb.MetricBatch_builder{
+					PodName: new(""),
+					Samples: []*pb.MetricSample{
+						pb.MetricSample_builder{
+							Name:            new("queue_depth"),
+							RecommenderName: new("queue-scaler"),
+							Labels:          map[string]string{"sub": "task-sub"},
+							Gauge:           new(float64(150)),
+							Timestamp:       timestamppb.New(time.Unix(1720000000, 0)),
+						}.Build(),
+					},
+				}.Build(),
+			},
+		},
+		{
 			name:      "Missing Metric Param",
 			namespace: "default",
 			def: pb.MetricDefinition_builder{
@@ -111,4 +146,66 @@ func TestProcessExternalMetric(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("Zero Timestamp Fallback", func(t *testing.T) {
+		def := pb.MetricDefinition_builder{
+			Name:            new("queue_depth"),
+			RecommenderName: new("queue-scaler"),
+			Provider:        new("k8s-external-metrics"),
+			Params: map[string]string{
+				"metric":   "pubsub_messages",
+				"selector": "sub=task-sub",
+			},
+		}.Build()
+
+		client := &fakeExternalClient{
+			items: []externalv1beta1.ExternalMetricValue{
+				{
+					MetricName:   "pubsub_messages",
+					MetricLabels: map[string]string{"sub": "task-sub"},
+					Timestamp:    metav1.Time{},
+					Value:        *resource.NewQuantity(150, resource.DecimalSI),
+				},
+			},
+		}
+
+		provider := &CoreClusterMetricsProvider{
+			externalMetricsClient: client,
+		}
+
+		before := time.Now().Unix()
+		got := provider.processExternalMetric("default", def, class)
+		after := time.Now().Unix()
+
+		if len(got) != 1 || len(got[0].GetSamples()) != 1 {
+			t.Fatalf("expected 1 batch with 1 sample, got %v", got)
+		}
+		gotSample := got[0].GetSamples()[0]
+		if !gotSample.HasTimestamp() {
+			t.Fatal("expected sample timestamp to be populated")
+		}
+		gotTs := gotSample.GetTimestamp().AsTime().Unix()
+		if gotTs < before || gotTs > after {
+			t.Errorf("expected fallback timestamp in [%d, %d], got %d (%v)", before, after, gotTs, gotSample.GetTimestamp().AsTime())
+		}
+
+		want := []*pb.MetricBatch{
+			pb.MetricBatch_builder{
+				PodName: new(""),
+				Samples: []*pb.MetricSample{
+					pb.MetricSample_builder{
+						Name:            new("queue_depth"),
+						RecommenderName: new("queue-scaler"),
+						Labels:          map[string]string{"sub": "task-sub"},
+						Gauge:           new(float64(150)),
+						Timestamp:       timestamppb.New(time.Unix(gotTs, 0)),
+					}.Build(),
+				},
+			}.Build(),
+		}
+
+		if diff := cmp.Diff(want, got, protocmp.Transform(), protocmp.IgnoreDefaultScalars()); diff != "" {
+			t.Errorf("processExternalMetric mismatch (-want +got):\n%s", diff)
+		}
+	})
 }

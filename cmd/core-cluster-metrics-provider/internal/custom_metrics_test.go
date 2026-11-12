@@ -167,4 +167,179 @@ func TestProcessCustomMetric(t *testing.T) {
 			t.Errorf("processCustomMetric mismatch (-want +got):\n%s", diff)
 		}
 	})
+
+	t.Run("Recommender-Owned Object Custom Metric Query (GetForObject)", func(t *testing.T) {
+		def := pb.MetricDefinition_builder{
+			Name:            new("service_http_requests"),
+			RecommenderName: new("linear-scaler"),
+			Provider:        new("k8s-custom-metrics"),
+			Params: map[string]string{
+				"targetKind": "Service",
+				"targetName": "frontend-service",
+				"metric":     "http_requests_per_second",
+			},
+		}.Build()
+
+		client := &fakeCustomClient{
+			objectMetric: &customv1beta2.MetricValue{
+				DescribedObject: corev1.ObjectReference{
+					Kind: "Service",
+					Name: "frontend-service",
+				},
+				Timestamp: metav1.Time{Time: now},
+				Value:     *resource.NewQuantity(450, resource.DecimalSI),
+			},
+		}
+
+		provider := &CoreClusterMetricsProvider{
+			customMetricsClient: client,
+		}
+
+		want := []*pb.MetricBatch{
+			pb.MetricBatch_builder{
+				PodName: new(""),
+				Samples: []*pb.MetricSample{
+					pb.MetricSample_builder{
+						Name:            new("service_http_requests"),
+						RecommenderName: new("linear-scaler"),
+						Gauge:           new(float64(450)),
+						Timestamp:       timestamppb.New(time.Unix(1720000000, 0)),
+					}.Build(),
+				},
+			}.Build(),
+		}
+
+		got := provider.processCustomMetric(policy.GetWorkload().GetNamespace(), policy, def, class)
+
+		if diff := cmp.Diff(want, got, protocmp.Transform(), protocmp.IgnoreDefaultScalars()); diff != "" {
+			t.Errorf("processCustomMetric mismatch (-want +got):\n%s", diff)
+		}
+	})
+
+	t.Run("Pod Custom Metric Zero Timestamp Fallback", func(t *testing.T) {
+		def := pb.MetricDefinition_builder{
+			Name:            new("pod_http_requests"),
+			RecommenderName: new("pod-scaler"),
+			Provider:        new("k8s-custom-metrics"),
+			Params: map[string]string{
+				"targetKind": "Pod",
+				"metric":     "http_requests_per_second",
+			},
+		}.Build()
+
+		client := &fakeCustomClient{
+			objectMetrics: &customv1beta2.MetricValueList{
+				Items: []customv1beta2.MetricValue{
+					{
+						DescribedObject: corev1.ObjectReference{
+							Kind: "Pod",
+							Name: "custom-metrics-consumer-pod-1",
+						},
+						Timestamp: metav1.Time{},
+						Value:     *resource.NewQuantity(85, resource.DecimalSI),
+					},
+				},
+			},
+		}
+
+		provider := &CoreClusterMetricsProvider{
+			customMetricsClient: client,
+		}
+
+		before := time.Now().Unix()
+		got := provider.processCustomMetric(policy.GetWorkload().GetNamespace(), policy, def, class)
+		after := time.Now().Unix()
+
+		if len(got) != 1 || len(got[0].GetSamples()) != 1 {
+			t.Fatalf("expected 1 batch with 1 sample, got %v", got)
+		}
+		gotSample := got[0].GetSamples()[0]
+		if !gotSample.HasTimestamp() {
+			t.Fatal("expected sample timestamp to be populated")
+		}
+		gotTs := gotSample.GetTimestamp().AsTime().Unix()
+		if gotTs < before || gotTs > after {
+			t.Errorf("expected fallback timestamp in [%d, %d], got %d (%v)", before, after, gotTs, gotSample.GetTimestamp().AsTime())
+		}
+
+		want := []*pb.MetricBatch{
+			pb.MetricBatch_builder{
+				PodName: new("custom-metrics-consumer-pod-1"),
+				Samples: []*pb.MetricSample{
+					pb.MetricSample_builder{
+						Name:            new("pod_http_requests"),
+						RecommenderName: new("pod-scaler"),
+						Gauge:           new(float64(85)),
+						Timestamp:       timestamppb.New(time.Unix(gotTs, 0)),
+					}.Build(),
+				},
+			}.Build(),
+		}
+
+		if diff := cmp.Diff(want, got, protocmp.Transform(), protocmp.IgnoreDefaultScalars()); diff != "" {
+			t.Errorf("processCustomMetric mismatch (-want +got):\n%s", diff)
+		}
+	})
+
+	t.Run("Object Custom Metric Zero Timestamp Fallback", func(t *testing.T) {
+		def := pb.MetricDefinition_builder{
+			Name:            new("service_http_requests"),
+			RecommenderName: new("linear-scaler"),
+			Provider:        new("k8s-custom-metrics"),
+			Params: map[string]string{
+				"targetKind": "Service",
+				"targetName": "frontend-service",
+				"metric":     "http_requests_per_second",
+			},
+		}.Build()
+
+		client := &fakeCustomClient{
+			objectMetric: &customv1beta2.MetricValue{
+				DescribedObject: corev1.ObjectReference{
+					Kind: "Service",
+					Name: "frontend-service",
+				},
+				Timestamp: metav1.Time{},
+				Value:     *resource.NewQuantity(450, resource.DecimalSI),
+			},
+		}
+
+		provider := &CoreClusterMetricsProvider{
+			customMetricsClient: client,
+		}
+
+		before := time.Now().Unix()
+		got := provider.processCustomMetric(policy.GetWorkload().GetNamespace(), policy, def, class)
+		after := time.Now().Unix()
+
+		if len(got) != 1 || len(got[0].GetSamples()) != 1 {
+			t.Fatalf("expected 1 batch with 1 sample, got %v", got)
+		}
+		gotSample := got[0].GetSamples()[0]
+		if !gotSample.HasTimestamp() {
+			t.Fatal("expected sample timestamp to be populated")
+		}
+		gotTs := gotSample.GetTimestamp().AsTime().Unix()
+		if gotTs < before || gotTs > after {
+			t.Errorf("expected fallback timestamp in [%d, %d], got %d (%v)", before, after, gotTs, gotSample.GetTimestamp().AsTime())
+		}
+
+		want := []*pb.MetricBatch{
+			pb.MetricBatch_builder{
+				PodName: new(""),
+				Samples: []*pb.MetricSample{
+					pb.MetricSample_builder{
+						Name:            new("service_http_requests"),
+						RecommenderName: new("linear-scaler"),
+						Gauge:           new(float64(450)),
+						Timestamp:       timestamppb.New(time.Unix(gotTs, 0)),
+					}.Build(),
+				},
+			}.Build(),
+		}
+
+		if diff := cmp.Diff(want, got, protocmp.Transform(), protocmp.IgnoreDefaultScalars()); diff != "" {
+			t.Errorf("processCustomMetric mismatch (-want +got):\n%s", diff)
+		}
+	})
 }
