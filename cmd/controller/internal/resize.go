@@ -107,6 +107,11 @@ func buildContainerResizePatch(pod *corev1.Pod, containerName string, reqs, lims
 				lims[name] = podLim.DeepCopy()
 			}
 		}
+		for name, q := range reqs {
+			if podLim, ok := podLevel.Limits[name]; ok && q.Cmp(podLim) > 0 {
+				reqs[name] = podLim.DeepCopy()
+			}
+		}
 		// Capping a limit may have brought it below its request.
 		for name, lim := range lims {
 			if req, ok := reqs[name]; ok && req.Cmp(lim) > 0 {
@@ -115,15 +120,21 @@ func buildContainerResizePatch(pod *corev1.Pod, containerName string, reqs, lims
 		}
 	}
 
+	effectiveReqs := merge(current.Requests, reqs)
 	if podLevel == nil && pod.Status.QOSClass != corev1.PodQOSGuaranteed &&
-		containersGuaranteed(pod, containerName, merge(current.Requests, reqs), merge(current.Limits, lims)) {
-		// Drop the recommended limits that would make the pod Guaranteed.
+		containersGuaranteed(pod, containerName, effectiveReqs, merge(current.Limits, lims)) {
+		// Drop the recommended limits that would make the pod Guaranteed,
+		// provided omitting them keeps any existing container limit >= request.
 		for name, lim := range lims {
-			if req, ok := reqs[name]; ok && req.Cmp(lim) == 0 {
+			req, hasReq := effectiveReqs[name]
+			if !hasReq || req.Cmp(lim) != 0 {
+				continue
+			}
+			if curLim, hasCurLim := current.Limits[name]; !hasCurLim || curLim.Cmp(req) >= 0 {
 				delete(lims, name)
 			}
 		}
-		if containersGuaranteed(pod, containerName, merge(current.Requests, reqs), merge(current.Limits, lims)) {
+		if containersGuaranteed(pod, containerName, effectiveReqs, merge(current.Limits, lims)) {
 			return nil, "resize would change the pod QoS class from Burstable to Guaranteed", nil
 		}
 	}
@@ -170,8 +181,9 @@ func aggregateRequestsExcept(pod *corev1.Pod, containerName string) corev1.Resou
 }
 
 // containersGuaranteed reports whether, with the named container given the
-// requests and limits, every container of the pod would have CPU and memory
-// requests == limits, i.e. the pod would be Guaranteed.
+// requests and limits, every container (including init containers) of the pod
+// would have positive CPU and memory requests == limits, i.e. the pod would be
+// Guaranteed.
 func containersGuaranteed(pod *corev1.Pod, containerName string, reqs, lims corev1.ResourceList) bool {
 	for _, c := range pod.Spec.Containers {
 		r, l := c.Resources.Requests, c.Resources.Limits
@@ -179,6 +191,11 @@ func containersGuaranteed(pod *corev1.Pod, containerName string, reqs, lims core
 			r, l = reqs, lims
 		}
 		if !isGuaranteed(r, l) {
+			return false
+		}
+	}
+	for _, c := range pod.Spec.InitContainers {
+		if !isGuaranteed(c.Resources.Requests, c.Resources.Limits) {
 			return false
 		}
 	}
@@ -205,13 +222,19 @@ func buildPodLevelResizePatch(pod *corev1.Pod, reqs, lims corev1.ResourceList) (
 	}
 
 	if pod.Status.QOSClass == corev1.PodQOSGuaranteed {
+		for name, q := range reqs {
+			if maxLim, ok := maxLims[name]; ok && q.Cmp(maxLim) < 0 {
+				reqs[name] = maxLim.DeepCopy()
+			}
+		}
 		lims = corev1.ResourceList{}
 		for name, q := range reqs {
 			lims[name] = q.DeepCopy()
 		}
 	} else {
+		effectiveReqs := merge(current.Requests, reqs)
 		for name, q := range lims {
-			lims[name] = maxQuantity(q, reqs[name], maxLims[name])
+			lims[name] = maxQuantity(q, effectiveReqs[name], maxLims[name])
 		}
 		// A request raised above an existing limit must raise the limit too.
 		for name, q := range reqs {
@@ -219,17 +242,24 @@ func buildPodLevelResizePatch(pod *corev1.Pod, reqs, lims corev1.ResourceList) (
 				continue
 			}
 			if cur, ok := current.Limits[name]; ok && cur.Cmp(q) < 0 {
-				lims[name] = q.DeepCopy()
+				lims[name] = maxQuantity(q, maxLims[name])
 			}
 		}
-		if isGuaranteed(merge(current.Requests, reqs), merge(current.Limits, lims)) {
-			// Drop the recommended limits that would make the pod Guaranteed.
+		if isGuaranteed(effectiveReqs, merge(current.Limits, lims)) {
+			// Drop the recommended limits that would make the pod Guaranteed,
+			// provided omitting them keeps any existing pod-level limit >= pod
+			// request and >= every container limit.
 			for name, lim := range lims {
-				if req, ok := reqs[name]; ok && req.Cmp(lim) == 0 {
+				req, hasReq := effectiveReqs[name]
+				if !hasReq || req.Cmp(lim) != 0 {
+					continue
+				}
+				curLim, hasCurLim := current.Limits[name]
+				if !hasCurLim || (curLim.Cmp(req) >= 0 && curLim.Cmp(maxLims[name]) >= 0) {
 					delete(lims, name)
 				}
 			}
-			if isGuaranteed(merge(current.Requests, reqs), merge(current.Limits, lims)) {
+			if isGuaranteed(effectiveReqs, merge(current.Limits, lims)) {
 				return nil, "resize would change the pod QoS class from Burstable to Guaranteed", nil
 			}
 		}
@@ -273,13 +303,13 @@ func containerResourceBounds(pod *corev1.Pod) (aggReqs, maxLims corev1.ResourceL
 	return aggReqs, maxLims
 }
 
-// isGuaranteed reports whether pod-level resources give the Guaranteed QoS
-// class: both CPU and memory set, with requests == limits.
+// isGuaranteed reports whether resources give the Guaranteed QoS class: both
+// CPU and memory set to positive quantities, with requests == limits.
 func isGuaranteed(reqs, lims corev1.ResourceList) bool {
 	for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
 		req, okReq := reqs[name]
 		lim, okLim := lims[name]
-		if !okReq || !okLim || req.Cmp(lim) != 0 {
+		if !okReq || !okLim || lim.Sign() <= 0 || req.Cmp(lim) != 0 {
 			return false
 		}
 	}
