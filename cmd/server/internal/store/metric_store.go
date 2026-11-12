@@ -51,6 +51,24 @@ func (ms *MetricSeries) setSeries(sid model.SeriesID, ser *model.Series) {
 	ms.Series[sid] = ser
 }
 
+func (ms *MetricSeries) clone() *MetricSeries {
+	if ms == nil {
+		return nil
+	}
+	var series map[model.SeriesID]*model.Series
+	if ms.Series != nil {
+		series = make(map[model.SeriesID]*model.Series, len(ms.Series))
+		for sid, ser := range ms.Series {
+			series[sid] = ser.Clone()
+		}
+	}
+	return &MetricSeries{
+		Series:       series,
+		Definition:   proto.CloneOf(ms.Definition),
+		ResourceName: ms.ResourceName,
+	}
+}
+
 // MetricStore holds the time-series and histogram state of a policy's metrics.
 type MetricStore struct {
 	// Series holds the state of every tracked metric, keyed by metric ID.
@@ -61,6 +79,22 @@ type MetricStore struct {
 func NewMetricStore() *MetricStore {
 	return &MetricStore{
 		Series: make(map[metricID]*MetricSeries),
+	}
+}
+
+func (ms *MetricStore) clone() *MetricStore {
+	if ms == nil {
+		return nil
+	}
+	var series map[metricID]*MetricSeries
+	if ms.Series != nil {
+		series = make(map[metricID]*MetricSeries, len(ms.Series))
+		for id, m := range ms.Series {
+			series[id] = m.clone()
+		}
+	}
+	return &MetricStore{
+		Series: series,
 	}
 }
 

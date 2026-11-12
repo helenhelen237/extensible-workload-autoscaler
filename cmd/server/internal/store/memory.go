@@ -59,6 +59,8 @@ type ServerStore interface {
 	// recommendation of the policies of a cluster each time it changes. The
 	// returned function unwatches.
 	WatchArbitratedRecommendations(clusterName string) (<-chan RecommendationEvent, func())
+	// Dump returns an isolated snapshot of the store state suitable for JSON
+	// serialization (e.g. on /storez) without holding store locks.
 	Dump() interface{}
 }
 
@@ -828,8 +830,52 @@ func (s *MemoryStore) calculateArbitratedReplicas(ps *PolicyState, isActive bool
 	return targetReplicas
 }
 
+func (ps *PolicyState) clone() *PolicyState {
+	if ps == nil {
+		return nil
+	}
+	var workload map[string]*pb.PodState
+	if ps.Workload != nil {
+		workload = make(map[string]*pb.PodState, len(ps.Workload))
+		for name, pod := range ps.Workload {
+			workload[name] = proto.CloneOf(pod)
+		}
+	}
+	var explanation []*pb.RecommenderStatus
+	if ps.Explanation != nil {
+		explanation = make([]*pb.RecommenderStatus, len(ps.Explanation))
+		for i, st := range ps.Explanation {
+			explanation[i] = proto.CloneOf(st)
+		}
+	}
+	var statuses map[string]*pb.RecommenderStatus
+	if ps.RecommenderStatuses != nil {
+		statuses = make(map[string]*pb.RecommenderStatus, len(ps.RecommenderStatuses))
+		for name, st := range ps.RecommenderStatuses {
+			statuses[name] = proto.CloneOf(st)
+		}
+	}
+	return &PolicyState{
+		Policy:                   proto.CloneOf(ps.Policy),
+		Workload:                 workload,
+		Metrics:                  ps.Metrics.clone(),
+		ArbitratedRecommendation: proto.CloneOf(ps.ArbitratedRecommendation),
+		Explanation:              explanation,
+		LastActive:               ps.LastActive,
+		RecommenderStatuses:      statuses,
+		ControlMetrics:           proto.CloneOf(ps.ControlMetrics),
+	}
+}
+
+// Dump returns a deep snapshot of s.state while holding s.mu.RLock so callers
+// such as /storez can serialize or inspect the returned state concurrently with
+// store writes.
 func (s *MemoryStore) Dump() interface{} {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.state
+	snapshot := make(map[policyID]*PolicyState, len(s.state))
+	for id, ps := range s.state {
+		snapshot[id] = ps.clone()
+	}
+	return snapshot
 }

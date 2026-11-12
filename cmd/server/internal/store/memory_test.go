@@ -3,10 +3,13 @@ package store
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"maps"
 	"math"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1710,4 +1713,355 @@ func TestOwnedMetricStatuses(t *testing.T) {
 	if diff := cmp.Diff(want, got); diff != "" {
 		t.Errorf("MetricStatuses mismatch (-want +got):\n%s", diff)
 	}
+}
+
+// TestDumpSnapshotIsolation verifies that Dump returns an isolated deep copy
+// of the store state so subsequent store mutations do not affect an earlier
+// snapshot (and vice versa).
+func TestDumpSnapshotIsolation(t *testing.T) {
+	start := time.Unix(1000, 0)
+	clk := &clock.FakeClock{CurrentTime: start}
+	s := NewMemoryStoreWithClock(clk)
+
+	id := pb.PolicyId_builder{ClusterName: new("default"), Namespace: new("default"), Name: new("iso-pol")}.Build()
+	pol := pb.Policy_builder{
+		Id: id,
+		Metrics: []*pb.MetricDefinition{
+			pb.MetricDefinition_builder{Name: new("cpu"), Gauge: pb.Gauge_builder{Aggregation: new("Avg")}.Build()}.Build(),
+			pb.MetricDefinition_builder{
+				Name: new("lat"),
+				Distribution: pb.Distribution_builder{
+					Percentile:  new("p95"),
+					Aggregation: new("Max"),
+				}.Build(),
+			}.Build(),
+		},
+		Scaling: []*pb.RecommenderDefinition{
+			pb.RecommenderDefinition_builder{Name: new("rec"), Recommender: new("Linear"), Type: new("Linear")}.Build(),
+		},
+		Workload:    pb.WorkloadRef_builder{Name: new("app")}.Build(),
+		MinReplicas: new(int32(1)),
+		MaxReplicas: new(int32(10)),
+	}.Build()
+	mustUpdatePolicy(t, s, "default", pol)
+
+	if err := s.UpdateWorkload(pb.UpdateWorkloadRequest_builder{
+		Id: id,
+		Workload: pb.Workload_builder{
+			Pods: []*pb.PodState{
+				pb.PodState_builder{Name: new("p1"), IsReady: new(true)}.Build(),
+			},
+		}.Build(),
+	}.Build()); err != nil {
+		t.Fatalf("UpdateWorkload() error = %v", err)
+	}
+
+	if err := s.AddBatch(pb.IngestMetricsRequest_builder{
+		ClusterName: new("default"),
+		Timestamp:   timestamppb.New(start),
+		PolicyMetrics: []*pb.PolicyMetricBatch{pb.PolicyMetricBatch_builder{
+			Namespace: new("default"),
+			Name:      new("iso-pol"),
+			Batches: []*pb.MetricBatch{pb.MetricBatch_builder{
+				PodName: new("p1"),
+				Samples: []*pb.MetricSample{
+					pb.MetricSample_builder{
+						Name:      new("cpu"),
+						Labels:    map[string]string{"zone": "a"},
+						Gauge:     new(1.5),
+						Timestamp: timestamppb.New(start),
+					}.Build(),
+					pb.MetricSample_builder{
+						Name: new("lat"),
+						Histogram: pb.Histogram_builder{
+							Buckets: map[string]uint64{"0.5": 5, "+Inf": 10},
+						}.Build(),
+						Timestamp: timestamppb.New(start),
+					}.Build(),
+				},
+			}.Build()},
+		}.Build()},
+	}.Build()); err != nil {
+		t.Fatalf("AddBatch() error = %v", err)
+	}
+
+	if err := s.UpdateRecommenderState(pb.UpdateRecommenderStateRequest_builder{
+		Id:              id,
+		RecommenderName: new("rec"),
+		Recommendation: pb.Recommendation_builder{
+			Replicas: new(int32(3)),
+			IsActive: new(true),
+		}.Build(),
+	}.Build()); err != nil {
+		t.Fatalf("UpdateRecommenderState() error = %v", err)
+	}
+	s.CalculateAll()
+
+	snapshot := s.Dump()
+	beforeJSON, err := json.MarshalIndent(snapshot, "", "  ")
+	if err != nil {
+		t.Fatalf("MarshalIndent(before) error = %v", err)
+	}
+
+	// Mutate every part of the store after taking the snapshot.
+	clk.CurrentTime = start.Add(10 * time.Second)
+	if err := s.UpdateWorkload(pb.UpdateWorkloadRequest_builder{
+		Id: id,
+		Workload: pb.Workload_builder{
+			Pods: []*pb.PodState{
+				pb.PodState_builder{Name: new("p1"), IsReady: new(false)}.Build(),
+				pb.PodState_builder{Name: new("p2"), IsReady: new(true)}.Build(),
+			},
+		}.Build(),
+	}.Build()); err != nil {
+		t.Fatalf("UpdateWorkload(after) error = %v", err)
+	}
+	if err := s.AddBatch(pb.IngestMetricsRequest_builder{
+		ClusterName: new("default"),
+		Timestamp:   timestamppb.New(clk.CurrentTime),
+		PolicyMetrics: []*pb.PolicyMetricBatch{pb.PolicyMetricBatch_builder{
+			Namespace: new("default"),
+			Name:      new("iso-pol"),
+			Batches: []*pb.MetricBatch{pb.MetricBatch_builder{
+				PodName: new("p2"),
+				Samples: []*pb.MetricSample{pb.MetricSample_builder{
+					Name:      new("cpu"),
+					Gauge:     new(9.0),
+					Timestamp: timestamppb.New(clk.CurrentTime),
+				}.Build()},
+			}.Build()},
+		}.Build()},
+	}.Build()); err != nil {
+		t.Fatalf("AddBatch(after) error = %v", err)
+	}
+	if err := s.UpdateRecommenderState(pb.UpdateRecommenderStateRequest_builder{
+		Id:              id,
+		RecommenderName: new("rec"),
+		Recommendation: pb.Recommendation_builder{
+			Replicas: new(int32(8)),
+			IsActive: new(true),
+		}.Build(),
+	}.Build()); err != nil {
+		t.Fatalf("UpdateRecommenderState(after) error = %v", err)
+	}
+	s.CalculateAll()
+
+	// Also create a second policy and delete the original policy.
+	otherID := pb.PolicyId_builder{ClusterName: new("default"), Namespace: new("default"), Name: new("other-pol")}.Build()
+	mustUpdatePolicy(t, s, "default", pb.Policy_builder{Id: otherID}.Build())
+	if err := s.DeletePolicy(id); err != nil {
+		t.Fatalf("DeletePolicy() error = %v", err)
+	}
+
+	afterJSON, err := json.MarshalIndent(snapshot, "", "  ")
+	if err != nil {
+		t.Fatalf("MarshalIndent(after) error = %v", err)
+	}
+	if string(beforeJSON) != string(afterJSON) {
+		t.Errorf("Snapshot mutated after store changes.\nBefore:\n%s\nAfter:\n%s", beforeJSON, afterJSON)
+	}
+}
+
+// TestDumpConcurrentAccess stresses concurrent store mutations alongside Dump
+// and JSON encoding (mirroring /storez) to verify there are no data races or
+// concurrent map iteration/write crashes.
+func TestDumpConcurrentAccess(t *testing.T) {
+	s := NewMemoryStore()
+	baseTime := time.Now().Add(-time.Hour)
+
+	makePolicy := func(name string, maxReplicas int32) *pb.Policy {
+		return pb.Policy_builder{
+			Id: pb.PolicyId_builder{ClusterName: new("default"), Namespace: new("default"), Name: new(name)}.Build(),
+			Metrics: []*pb.MetricDefinition{
+				pb.MetricDefinition_builder{Name: new("cpu"), Gauge: pb.Gauge_builder{Aggregation: new("Avg")}.Build()}.Build(),
+				pb.MetricDefinition_builder{
+					Name:  new("mem"),
+					Scope: new("Pod"),
+					DecayingDistribution: pb.DecayingDistribution_builder{
+						HalfLife:   durationpb.New(time.Hour),
+						BucketSize: new("0.1"),
+						Percentile: new("p95"),
+					}.Build(),
+				}.Build(),
+				pb.MetricDefinition_builder{
+					Name: new("lat"),
+					Distribution: pb.Distribution_builder{
+						Percentile:  new("p95"),
+						Aggregation: new("Max"),
+					}.Build(),
+				}.Build(),
+			},
+			Scaling: []*pb.RecommenderDefinition{
+				pb.RecommenderDefinition_builder{Name: new("hpa"), Recommender: new("Linear"), Type: new("Linear")}.Build(),
+				pb.RecommenderDefinition_builder{Name: new("vpa"), Recommender: new("VPA"), Type: new("VPA")}.Build(),
+			},
+			RecommenderMetrics: map[string]*pb.MetricDefinitionList{
+				"vpa": pb.MetricDefinitionList_builder{Definitions: []*pb.MetricDefinition{
+					pb.MetricDefinition_builder{
+						Name:            new("cpu"),
+						RecommenderName: new("vpa"),
+						Scope:           new("PodContainer"),
+						Gauge:           pb.Gauge_builder{Aggregation: new("Max")}.Build(),
+					}.Build(),
+				}}.Build(),
+			},
+			Workload:    pb.WorkloadRef_builder{Kind: new("Deployment"), Name: new(name)}.Build(),
+			MinReplicas: new(int32(1)),
+			MaxReplicas: new(maxReplicas),
+		}.Build()
+	}
+
+	const steadyPolicy = "steady-pol"
+	steadyID := pb.PolicyId_builder{ClusterName: new("default"), Namespace: new("default"), Name: new(steadyPolicy)}.Build()
+	mustUpdatePolicy(t, s, "default", makePolicy(steadyPolicy, 10))
+
+	const iterations = 200
+	var wg sync.WaitGroup
+
+	// Writer 1: Policy churn (create/update/delete policies to mutate s.state and CleanupOrphaned).
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := range iterations {
+			ephemeral := fmt.Sprintf("ephemeral-%d", i%8)
+			ephemeralID := pb.PolicyId_builder{ClusterName: new("default"), Namespace: new("default"), Name: new(ephemeral)}.Build()
+			_, _ = s.UpdatePolicy("default", true, makePolicy(ephemeral, int32(5+(i%10))))
+			_, _ = s.UpdatePolicy("default", true, makePolicy(steadyPolicy, int32(10+(i%5))))
+			if i%2 == 1 {
+				_ = s.DeletePolicy(ephemeralID)
+			}
+		}
+	}()
+
+	// Writer 2: Workload pod churn (replaces and resizes ps.Workload).
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := range iterations {
+			var pods []*pb.PodState
+			for p := range (i % 6) + 1 {
+				pods = append(pods, pb.PodState_builder{
+					Name:     new(fmt.Sprintf("pod-%d", p)),
+					NodeName: new(fmt.Sprintf("node-%d", p%2)),
+					IsReady:  new(true),
+				}.Build())
+			}
+			_ = s.UpdateWorkload(pb.UpdateWorkloadRequest_builder{
+				Id:       steadyID,
+				Workload: pb.Workload_builder{Pods: pods}.Build(),
+			}.Build())
+		}
+	}()
+
+	// Writer 3: Metric ingestion across multiple pods, labels, histograms, and owned metrics (mutates Metrics.Series & series maps).
+	for w := range 2 {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			for i := range iterations {
+				ts := baseTime.Add(time.Duration(i*2+worker) * time.Second)
+				podName := fmt.Sprintf("pod-%d", (i+worker)%6)
+				labelVal := fmt.Sprintf("z-%d", i%4)
+				_ = s.AddBatch(pb.IngestMetricsRequest_builder{
+					ClusterName: new("default"),
+					Timestamp:   timestamppb.New(ts),
+					PolicyMetrics: []*pb.PolicyMetricBatch{pb.PolicyMetricBatch_builder{
+						Namespace: new("default"),
+						Name:      new(steadyPolicy),
+						Batches: []*pb.MetricBatch{pb.MetricBatch_builder{
+							PodName:       new(podName),
+							ContainerName: new("app"),
+							Samples: []*pb.MetricSample{
+								pb.MetricSample_builder{
+									Name:      new("cpu"),
+									Labels:    map[string]string{"zone": labelVal},
+									Gauge:     new(float64(i%10) * 0.25),
+									Timestamp: timestamppb.New(ts),
+								}.Build(),
+								pb.MetricSample_builder{
+									Name:      new("mem"),
+									Gauge:     new(float64((i%5)+1) * 0.3),
+									Timestamp: timestamppb.New(ts),
+								}.Build(),
+								pb.MetricSample_builder{
+									Name: new("lat"),
+									Histogram: pb.Histogram_builder{
+										Buckets: map[string]uint64{
+											"0.1":  uint64(i + 1),
+											"1.0":  uint64(2 * (i + 1)),
+											"+Inf": uint64(3 * (i + 1)),
+										},
+									}.Build(),
+									Timestamp: timestamppb.New(ts),
+								}.Build(),
+								pb.MetricSample_builder{
+									Name:            new("cpu"),
+									RecommenderName: new("vpa"),
+									Gauge:           new(float64(i%7) * 0.1),
+									Timestamp:       timestamppb.New(ts),
+								}.Build(),
+							},
+						}.Build()},
+					}.Build()},
+				}.Build())
+			}
+		}(w)
+	}
+
+	// Writer 4: Recommender status updates & deletions + CalculateAll.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := range iterations {
+			if i%5 == 0 {
+				_ = s.UpdateRecommenderState(pb.UpdateRecommenderStateRequest_builder{
+					Id:              steadyID,
+					RecommenderName: new("hpa"),
+				}.Build())
+			} else {
+				_ = s.UpdateRecommenderState(pb.UpdateRecommenderStateRequest_builder{
+					Id:              steadyID,
+					RecommenderName: new("hpa"),
+					Recommendation: pb.Recommendation_builder{
+						Replicas: new(int32((i % 8) + 1)),
+						IsActive: new(true),
+						Message:  new("scaling"),
+					}.Build(),
+				}.Build())
+			}
+			_ = s.UpdateRecommenderState(pb.UpdateRecommenderStateRequest_builder{
+				Id:              steadyID,
+				RecommenderName: new("vpa"),
+				Recommendation: pb.Recommendation_builder{
+					IsActive: new(true),
+					WorkloadResources: []*pb.ContainerResource{
+						pb.ContainerResource_builder{
+							ContainerName: new("app"),
+							Requests:      map[string]string{"cpu": "250m"},
+						}.Build(),
+					},
+				}.Build(),
+			}.Build())
+			s.CalculateAll()
+		}
+	}()
+
+	// Readers: Concurrently Dump and JSON-encode the returned state just like /storez.
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range iterations {
+				state := s.Dump()
+				enc := json.NewEncoder(io.Discard)
+				enc.SetIndent("", "  ")
+				if err := enc.Encode(state); err != nil {
+					t.Errorf("Encode(Dump()) error = %v", err)
+					return
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
 }

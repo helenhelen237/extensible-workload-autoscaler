@@ -3,6 +3,7 @@ package model
 import (
 	"fmt"
 	"hash/fnv"
+	"maps"
 	"sort"
 	"time"
 )
@@ -51,6 +52,16 @@ type Sample struct {
 	DecayingHistogram *DecayingHistogram
 }
 
+// Clone returns a deep copy of s.
+func (s Sample) Clone() Sample {
+	return Sample{
+		Timestamp:         s.Timestamp,
+		Value:             s.Value,
+		Distribution:      s.Distribution.Clone(),
+		DecayingHistogram: s.DecayingHistogram.Clone(),
+	}
+}
+
 // TimeWindow aggregates the samples of a single series over time.
 type TimeWindow interface {
 	// Apply returns the aggregate, reporting false when there is nothing to
@@ -95,6 +106,23 @@ type Series struct {
 	LastIngested time.Time
 	// TimeWindow is the temportal aggregation for the series.
 	TimeWindow TimeWindow `json:"-"`
+}
+
+// Clone returns a deep copy of the series' exported state, omitting TimeWindow.
+func (s *Series) Clone() *Series {
+	if s == nil {
+		return nil
+	}
+	return &Series{
+		PodName:       s.PodName,
+		ContainerName: s.ContainerName,
+		ResourceName:  s.ResourceName,
+		Labels:        maps.Clone(s.Labels),
+		Type:          s.Type,
+		LastRaw:       s.LastRaw.Clone(),
+		LastRawWindow: s.LastRawWindow,
+		LastIngested:  s.LastIngested,
+	}
 }
 
 // NewSeries returns a series of samples of type typ reported by the given
