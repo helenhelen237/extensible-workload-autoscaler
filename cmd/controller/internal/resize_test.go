@@ -37,6 +37,15 @@ func withContainer(name string, req, lim corev1.ResourceList) podOpt {
 	}
 }
 
+func withInitContainer(name string, req, lim corev1.ResourceList) podOpt {
+	return func(p *corev1.Pod) {
+		p.Spec.InitContainers = append(p.Spec.InitContainers, corev1.Container{
+			Name:      name,
+			Resources: corev1.ResourceRequirements{Requests: req, Limits: lim},
+		})
+	}
+}
+
 func newPod(opts ...podOpt) *corev1.Pod {
 	p := &corev1.Pod{}
 	p.Name = "p"
@@ -109,6 +118,43 @@ func TestBuildResizePatch_PodLevel(t *testing.T) {
 			requests:  map[string]string{"cpu": "300m"},
 			limits:    map[string]string{"cpu": "600m"},
 			wantPatch: map[string]map[string]string{"requests": {"cpu": "300m"}, "limits": {"cpu": "300m"}},
+		},
+		{
+			name:      "Guaranteed pod raises request and limit to largest container limit",
+			pod:       newPod(withQoS(corev1.PodQOSGuaranteed), withContainer("a", rl("cpu", "100m"), rl("cpu", "400m")), withPodResources(rl("cpu", "500m", "memory", "64Mi"), rl("cpu", "500m", "memory", "64Mi"))),
+			requests:  map[string]string{"cpu": "200m"},
+			wantPatch: map[string]map[string]string{"requests": {"cpu": "400m"}, "limits": {"cpu": "400m"}},
+		},
+		{
+			name:     "Burstable pod skipped when raising request above existing limit would make it Guaranteed",
+			pod:      newPod(withContainer("a", nil, nil), withPodResources(rl("cpu", "200m", "memory", "64Mi"), rl("cpu", "400m", "memory", "64Mi"))),
+			requests: map[string]string{"cpu": "500m"},
+			wantSkip: "Guaranteed",
+		},
+		{
+			name:     "Burstable pod skipped when raising request and limit above existing limit would make it Guaranteed",
+			pod:      newPod(withContainer("a", nil, nil), withPodResources(rl("cpu", "200m", "memory", "64Mi"), rl("cpu", "400m", "memory", "64Mi"))),
+			requests: map[string]string{"cpu": "500m"},
+			limits:   map[string]string{"cpu": "500m"},
+			wantSkip: "Guaranteed",
+		},
+		{
+			name:      "Burstable pod keeps raised limit when another resource stays Burstable",
+			pod:       newPod(withContainer("a", nil, nil), withPodResources(rl("cpu", "200m", "memory", "64Mi"), rl("cpu", "400m", "memory", "128Mi"))),
+			requests:  map[string]string{"cpu": "500m", "memory": "100Mi"},
+			limits:    map[string]string{"cpu": "500m", "memory": "100Mi"},
+			wantPatch: map[string]map[string]string{"requests": {"cpu": "500m", "memory": "100Mi"}, "limits": {"cpu": "500m"}},
+		},
+		{
+			name:      "Limits-only update raises limit to existing pod-level request",
+			pod:       newPod(withContainer("a", nil, nil), withPodResources(rl("cpu", "500m"), rl("cpu", "1"))),
+			limits:    map[string]string{"cpu": "300m"},
+			wantPatch: map[string]map[string]string{"limits": {"cpu": "500m"}},
+		},
+		{
+			name:   "Limits-only update drops limit that would make Burstable pod Guaranteed",
+			pod:    newPod(withContainer("a", nil, nil), withPodResources(rl("cpu", "500m", "memory", "64Mi"), rl("cpu", "1", "memory", "64Mi"))),
+			limits: map[string]string{"cpu": "500m"},
 		},
 		{
 			name:     "Burstable pod is not turned into a Guaranteed one",
@@ -240,6 +286,79 @@ func TestBuildResizePatch_Container(t *testing.T) {
 			container: "main",
 			requests:  map[string]string{"cpu": "1"},
 			wantSkip:  "Guaranteed",
+		},
+		{
+			name: "Burstable pod skipped when raising request above existing limit would make it Guaranteed",
+			pod: newPod(
+				withContainer("main", rl("cpu", "500m", "memory", "64Mi"), rl("cpu", "1", "memory", "64Mi")),
+				withContainer("sidecar", rl("cpu", "100m", "memory", "32Mi"), rl("cpu", "100m", "memory", "32Mi")),
+			),
+			container: "main",
+			requests:  map[string]string{"cpu": "1500m"},
+			wantSkip:  "Guaranteed",
+		},
+		{
+			name: "Burstable pod skipped when raising request and limit above existing limit would make it Guaranteed",
+			pod: newPod(
+				withContainer("main", rl("cpu", "500m", "memory", "64Mi"), rl("cpu", "1", "memory", "64Mi")),
+				withContainer("sidecar", rl("cpu", "100m", "memory", "32Mi"), rl("cpu", "100m", "memory", "32Mi")),
+			),
+			container: "main",
+			requests:  map[string]string{"cpu": "1500m"},
+			limits:    map[string]string{"cpu": "1500m"},
+			wantSkip:  "Guaranteed",
+		},
+		{
+			name: "Burstable pod keeps raised limit when another resource stays Burstable",
+			pod: newPod(
+				withContainer("main", rl("cpu", "500m", "memory", "64Mi"), rl("cpu", "1", "memory", "128Mi")),
+				withContainer("sidecar", rl("cpu", "100m", "memory", "32Mi"), rl("cpu", "100m", "memory", "32Mi")),
+			),
+			container: "main",
+			requests:  map[string]string{"cpu": "1500m", "memory": "100Mi"},
+			limits:    map[string]string{"cpu": "1500m", "memory": "100Mi"},
+			wantPatch: map[string]map[string]string{"requests": {"cpu": "1500m", "memory": "100Mi"}, "limits": {"cpu": "1500m"}},
+		},
+		{
+			name: "Limits-only update drops limit that would make Burstable pod Guaranteed",
+			pod: newPod(
+				withContainer("main", rl("cpu", "500m", "memory", "64Mi"), rl("cpu", "1", "memory", "64Mi")),
+				withContainer("sidecar", rl("cpu", "100m", "memory", "32Mi"), rl("cpu", "100m", "memory", "32Mi")),
+			),
+			container: "main",
+			limits:    map[string]string{"cpu": "500m"},
+		},
+		{
+			name: "Burstable pod with non-Guaranteed init container keeps limits == requests on app container",
+			pod: newPod(
+				withInitContainer("init", rl("cpu", "100m"), nil),
+				withContainer("main", rl("cpu", "200m", "memory", "64Mi"), rl("cpu", "500m", "memory", "64Mi")),
+			),
+			container: "main",
+			requests:  map[string]string{"cpu": "300m"},
+			limits:    map[string]string{"cpu": "300m"},
+			wantPatch: map[string]map[string]string{"requests": {"cpu": "300m"}, "limits": {"cpu": "300m"}},
+		},
+		{
+			name: "Burstable pod with Guaranteed init container drops limit that would make pod Guaranteed",
+			pod: newPod(
+				withInitContainer("init", rl("cpu", "100m", "memory", "32Mi"), rl("cpu", "100m", "memory", "32Mi")),
+				withContainer("main", rl("cpu", "200m", "memory", "64Mi"), rl("cpu", "500m", "memory", "64Mi")),
+			),
+			container: "main",
+			requests:  map[string]string{"cpu": "300m"},
+			limits:    map[string]string{"cpu": "300m"},
+			wantPatch: map[string]map[string]string{"requests": {"cpu": "300m"}},
+		},
+		{
+			name: "Pod-level limit without pod-level request caps container request",
+			pod: newPod(
+				withContainer("main", rl("cpu", "100m"), nil),
+				withPodResources(nil, rl("cpu", "500m")),
+			),
+			container: "main",
+			requests:  map[string]string{"cpu": "800m"},
+			wantPatch: map[string]map[string]string{"requests": {"cpu": "500m"}},
 		},
 		{
 			name: "Pod-level resources cap the container request and limit",
