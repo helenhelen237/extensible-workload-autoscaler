@@ -57,12 +57,18 @@ func NewDecayingHistogram(now time.Time, halfLife time.Duration, bucketSizeStr s
 
 // Add sample to the histogram.
 func (h *DecayingHistogram) Add(value float64, timestamp time.Time) {
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return
+	}
 	if timestamp.Before(h.ReferenceTime) {
 		// Sample is from the past. Add it with a reduced weight
 		// equivalent to what it would be if it had been added at its own time
 		// and then decayed to the current ReferenceTime.
 		elapsed := h.ReferenceTime.Sub(timestamp)
 		weight := math.Pow(0.5, float64(elapsed)/float64(h.HalfLife))
+		if weight < 1e-6 {
+			return
+		}
 
 		bucketIdx := int(math.Floor(value / h.BucketSize))
 		h.Buckets[bucketIdx] += weight
@@ -96,16 +102,20 @@ func (h *DecayingHistogram) decay(now time.Time) {
 		return
 	}
 
-	// Apply decay
-	h.TotalWeight *= decayFactor
-	for k := range h.Buckets {
-		h.Buckets[k] *= decayFactor
-		// Cleanup empty buckets
-		if h.Buckets[k] < 1e-6 {
+	// Apply decay and recompute TotalWeight from surviving buckets so pruned
+	// buckets do not leave phantom weight behind.
+	var totalWeight float64
+	for k, w := range h.Buckets {
+		w *= decayFactor
+		if w < 1e-6 {
 			delete(h.Buckets, k)
+			continue
 		}
+		h.Buckets[k] = w
+		totalWeight += w
 	}
 
+	h.TotalWeight = totalWeight
 	h.ReferenceTime = now
 }
 
@@ -116,6 +126,9 @@ func (h *DecayingHistogram) decay(now time.Time) {
 // decayed to the reference time of the other one, so that the weights of both
 // histograms are comparable.
 func (h *DecayingHistogram) Merge(other *DecayingHistogram) {
+	if other == nil || other.TotalWeight == 0 {
+		return
+	}
 	if h.TotalWeight == 0 {
 		// Nothing to decay in h: it simply adopts other's reference time.
 		h.ReferenceTime = other.ReferenceTime
@@ -127,10 +140,17 @@ func (h *DecayingHistogram) Merge(other *DecayingHistogram) {
 	if elapsed := h.ReferenceTime.Sub(other.ReferenceTime); elapsed > 0 {
 		factor = math.Pow(0.5, float64(elapsed)/float64(h.HalfLife))
 	}
-	for idx, w := range other.Buckets {
-		h.Buckets[idx] += w * factor
+	if factor < 1e-6 {
+		return
 	}
-	h.TotalWeight += other.TotalWeight * factor
+	for idx, w := range other.Buckets {
+		decayed := w * factor
+		if decayed < 1e-6 {
+			continue
+		}
+		h.Buckets[idx] += decayed
+		h.TotalWeight += decayed
+	}
 }
 
 // Percentile calculates the approximate percentile value.

@@ -3034,3 +3034,107 @@ func TestIntent_PodScope_DecayingDistribution(t *testing.T) {
 		t.Errorf("ControlMetrics mismatch (-want +got):\n%s", diff)
 	}
 }
+
+func TestIngestMetrics_DecayingDistributionRateMultiPodAndPodScopeResource(t *testing.T) {
+	clk := &clock.FakeClock{CurrentTime: time.Unix(10000, 0)}
+	memStore, client, cleanup := setupFunctionalGRPCServer(t, clk)
+	defer cleanup()
+	ctx := context.Background()
+
+	id := pb.PolicyId_builder{ClusterName: new("c1"), Namespace: new("ns"), Name: new("p1")}.Build()
+	if _, err := client.CreatePolicy(ctx, pb.CreatePolicyRequest_builder{
+		Policy: pb.Policy_builder{
+			Id: id,
+			Metrics: []*pb.MetricDefinition{
+				pb.MetricDefinition_builder{
+					Name: new("global_cpu_rate"),
+					DecayingDistribution: pb.DecayingDistribution_builder{
+						HalfLife:   durationpb.New(time.Hour),
+						BucketSize: new("0.1"),
+						Percentile: new("p100"),
+						Rate:       durationpb.New(0),
+					}.Build(),
+				}.Build(),
+				pb.MetricDefinition_builder{
+					Name:  new("pod_cpu_rate"),
+					Scope: new("Pod"),
+					DecayingDistribution: pb.DecayingDistribution_builder{
+						HalfLife:   durationpb.New(time.Hour),
+						BucketSize: new("0.1"),
+						Percentile: new("p100"),
+						Rate:       durationpb.New(0),
+					}.Build(),
+				}.Build(),
+			},
+		}.Build(),
+	}.Build()); err != nil {
+		t.Fatalf("CreatePolicy() = %v", err)
+	}
+
+	start := timestamppb.New(time.Unix(9000, 0))
+	ready := timestamppb.New(time.Unix(9010, 0))
+	// Containers intentionally declare no CPU requests to ensure pod-scoped
+	// distribution rollups merge container histograms without dropping them.
+	if _, err := client.UpdateWorkload(ctx, pb.UpdateWorkloadRequest_builder{
+		Id: id,
+		Workload: pb.Workload_builder{Pods: []*pb.PodState{
+			pb.PodState_builder{
+				Name: new("pod-1"), Phase: new("Running"), StartTime: start, IsReady: new(true), ReadyLastTransitionTime: ready,
+				Containers: []*pb.ContainerState{pb.ContainerState_builder{Name: new("app")}.Build()},
+			}.Build(),
+			pb.PodState_builder{
+				Name: new("pod-2"), Phase: new("Running"), StartTime: start, IsReady: new(true), ReadyLastTransitionTime: ready,
+				Containers: []*pb.ContainerState{pb.ContainerState_builder{Name: new("app")}.Build()},
+			}.Build(),
+		}}.Build(),
+	}.Build()); err != nil {
+		t.Fatalf("UpdateWorkload() = %v", err)
+	}
+
+	ingestCounters := func(ts time.Time, pod1Val, pod2Val float64) {
+		t.Helper()
+		pbTS := timestamppb.New(ts)
+		samplesFor := func(v float64) []*pb.MetricSample {
+			return []*pb.MetricSample{
+				pb.MetricSample_builder{Name: new("global_cpu_rate"), ResourceName: new("cpu"), Counter: new(v), Timestamp: pbTS}.Build(),
+				pb.MetricSample_builder{Name: new("pod_cpu_rate"), ResourceName: new("cpu"), Counter: new(v), Timestamp: pbTS}.Build(),
+			}
+		}
+		if _, err := client.IngestMetrics(ctx, pb.IngestMetricsRequest_builder{
+			ClusterName: new("c1"), Timestamp: pbTS,
+			PolicyMetrics: []*pb.PolicyMetricBatch{pb.PolicyMetricBatch_builder{
+				Namespace: new("ns"), Name: new("p1"),
+				Batches: []*pb.MetricBatch{
+					pb.MetricBatch_builder{PodName: new("pod-1"), ContainerName: new("app"), Samples: samplesFor(pod1Val)}.Build(),
+					pb.MetricBatch_builder{PodName: new("pod-2"), ContainerName: new("app"), Samples: samplesFor(pod2Val)}.Build(),
+				},
+			}.Build()},
+		}.Build()); err != nil {
+			t.Fatalf("IngestMetrics(%v) = %v", ts, err)
+		}
+	}
+
+	// Scrape 1: pod-1 at 1000s, pod-2 at 20s.
+	ingestCounters(clk.Now(), 1000, 20)
+	// Scrape 2 (+10s): pod-1 used 0.75 cores (+7.5s), pod-2 used 0.35 cores (+3.5s).
+	clk.Advance(10 * time.Second)
+	ingestCounters(clk.Now(), 1007.5, 23.5)
+
+	memStore.CalculateAll()
+	res := getControlMetrics(t, ctx, client, id)
+
+	wantRes := pb.GetControlMetricsResponse_builder{
+		Timestamp:     timestamppb.New(clk.Now()),
+		ReadyReplicas: new(int32(2)),
+		ControlMetrics: pb.ControlMetrics_builder{
+			Values: map[string]float64{"global_cpu_rate": 0.8}, // bucket [0.7, 0.8)
+			PodMetrics: map[string]*pb.MetricValues{
+				"pod-1": pb.MetricValues_builder{Values: map[string]float64{"pod_cpu_rate": 0.8}}.Build(),
+				"pod-2": pb.MetricValues_builder{Values: map[string]float64{"pod_cpu_rate": 0.4}}.Build(),
+			},
+		}.Build(),
+	}.Build()
+	if diff := cmp.Diff(wantRes, res, protocmp.Transform(), protocmp.IgnoreDefaultScalars(), cmpopts.EquateApprox(0, 1e-6)); diff != "" {
+		t.Errorf("ControlMetrics mismatch (-want +got):\n%s", diff)
+	}
+}

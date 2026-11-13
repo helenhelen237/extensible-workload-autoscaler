@@ -56,30 +56,33 @@ type DimensionalSeriesAggregation struct {
 	FinalTransform SeriesTransform
 	// ResourceName is the resource described by the series, if any.
 	ResourceName string
-	// A workload-wide temporal aggregation. Used for decaying distributions
-	// over long time windows: those are not an aggregation of per-series
-	// distributions.
-	WorkloadTimeWindow model.TimeWindow
+	// WorkloadHistogram is the shared workload-wide decaying histogram used for
+	// global decaying distributions over long time windows: each series keeps
+	// its own rate window (if any) and feeds this shared histogram.
+	WorkloadHistogram *model.DecayingHistogram
+	// GlobalDecayingDistribution reports whether the metric is a global
+	// decaying distribution backed by WorkloadHistogram rather than an
+	// aggregation of per-series distributions.
+	GlobalDecayingDistribution bool
 }
 
 var _ SeriesAggregation = (*DimensionalSeriesAggregation)(nil)
 
 // NewTimeWindow implements SeriesAggregation.
 func (a *DimensionalSeriesAggregation) NewTimeWindow(def *pb.MetricDefinition, typ model.SampleType) model.TimeWindow {
-	if a.WorkloadTimeWindow != nil {
-		return a.WorkloadTimeWindow
+	if a.GlobalDecayingDistribution {
+		return newDecayingDistributionAggregation(def.GetDecayingDistribution(), typ, a.WorkloadHistogram)
 	}
 	return NewTimeWindow(def, typ)
 }
 
 // Reduce implements SeriesAggregation.
 func (a *DimensionalSeriesAggregation) Reduce(series iter.Seq[*model.Series], workload map[string]*pb.PodState, now time.Time) []*SeriesAggregate {
-	if a.WorkloadTimeWindow != nil {
-		sample, ok := a.WorkloadTimeWindow.Apply()
-		if !ok {
+	if a.GlobalDecayingDistribution {
+		if a.WorkloadHistogram == nil || a.WorkloadHistogram.TotalWeight == 0 {
 			return nil
 		}
-		aggregate := &SeriesAggregate{sample: sample}
+		aggregate := &SeriesAggregate{sample: model.Sample{DecayingHistogram: a.WorkloadHistogram}}
 		if a.FinalTransform != nil {
 			a.FinalTransform(workload, aggregate, a.ResourceName)
 		}
@@ -152,9 +155,10 @@ func CreateSeriesAggregation(def *pb.MetricDefinition, typ model.SampleType, res
 		finalTransform = ReplicaAverageTransform
 	}
 
-	// A workload-wide temporal aggregation. Used by decaying distributions over
-	// long time windows.
-	workloadDecayingDistribution := model.TimeWindow(nil)
+	// A workload-wide decaying histogram. Used by global decaying distributions
+	// over long time windows, while each series maintains its own rate window.
+	workloadHistogram := (*model.DecayingHistogram)(nil)
+	globalDecayingDistribution := false
 
 	switch {
 	case def.HasGauge() && def.GetGauge().GetAggregation() != "":
@@ -172,10 +176,12 @@ func CreateSeriesAggregation(def *pb.MetricDefinition, typ model.SampleType, res
 	// For global metrics with decaying distributions, we only build one
 	// distribution for the whole workload (i.e. not one-per-series).
 	case def.HasDecayingDistribution() && (def.GetScope() == "" || def.GetScope() == model.ScopeGlobal):
-		workloadDecayingDistribution = NewDecayingDistributionAggregation(def.GetDecayingDistribution(), typ)
-		// Don't aggregate series, only use the workload-wide time window.
+		dd := def.GetDecayingDistribution()
+		workloadHistogram, _ = model.NewDecayingHistogram(time.Time{}, dd.GetHalfLife().AsDuration(), dd.GetBucketSize())
+		globalDecayingDistribution = true
+		// Don't aggregate series, only use the workload-wide histogram.
 		podReducer, containerReducer, labelsReducer = nil, nil, nil
-		finalTransform = CreatePercentileTransform(parsePercentile(def.GetDecayingDistribution().GetPercentile()))
+		finalTransform = CreatePercentileTransform(parsePercentile(dd.GetPercentile()))
 	case def.HasDecayingDistribution():
 		// Idem, with the decaying histograms.
 		merge := CreateMergeDecayingDistributionSeriesReducer(def.GetDecayingDistribution())
@@ -194,25 +200,27 @@ func CreateSeriesAggregation(def *pb.MetricDefinition, typ model.SampleType, res
 		containerReducer = nil
 	}
 
-	// When the containers are rolled up into their pod, the samples related to
-	// a resource are weighted by their container's share of the pod requests
+	// When the containers are rolled up into their pod, scalar samples related
+	// to a resource are weighted by their container's share of the pod requests
 	// for that resource, so that their sum is the pod-level value. Containers
 	// without a request for the resource have no meaningful weight and are
-	// left out of the rollup.
+	// left out of the rollup. Distribution and decaying distribution samples
+	// carry histograms that are merged directly rather than request-weighted.
 	containerTransform := SeriesTransform(nil)
-	if resourceName != "" && containerReducer != nil {
+	if resourceName != "" && containerReducer != nil && !def.HasDistribution() && !def.HasDecayingDistribution() {
 		containerTransform = ContainerResourceWeightedTransform
 	}
 
 	return &DimensionalSeriesAggregation{
-		Filters:            seriesFilters,
-		LabelsReducer:      labelsReducer,
-		ContainerTransform: containerTransform,
-		ContainerReducer:   containerReducer,
-		PodReducer:         podReducer,
-		FinalTransform:     finalTransform,
-		ResourceName:       resourceName,
-		WorkloadTimeWindow: workloadDecayingDistribution,
+		Filters:                    seriesFilters,
+		LabelsReducer:              labelsReducer,
+		ContainerTransform:         containerTransform,
+		ContainerReducer:           containerReducer,
+		PodReducer:                 podReducer,
+		FinalTransform:             finalTransform,
+		ResourceName:               resourceName,
+		WorkloadHistogram:          workloadHistogram,
+		GlobalDecayingDistribution: globalDecayingDistribution,
 	}
 }
 
@@ -547,6 +555,10 @@ func NewDecayingDistributionAggregation(def *pb.DecayingDistribution, typ model.
 	halfLife := def.GetHalfLife().AsDuration()
 	// The reference time is set by the first sample.
 	histogram, _ := model.NewDecayingHistogram(time.Time{}, halfLife, def.GetBucketSize())
+	return newDecayingDistributionAggregation(def, typ, histogram)
+}
+
+func newDecayingDistributionAggregation(def *pb.DecayingDistribution, typ model.SampleType, histogram *model.DecayingHistogram) *DecayingDistributionAggregation {
 	a := &DecayingDistributionAggregation{histogram: histogram}
 	if def.HasRate() {
 		a.rate = NewRateAggregation(def.GetRate().AsDuration(), typ)

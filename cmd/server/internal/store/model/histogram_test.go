@@ -377,4 +377,118 @@ func TestDecayingHistogram_EdgeCases(t *testing.T) {
 			t.Errorf("Expected 0 weight after massive decay, got %v", h.TotalWeight)
 		}
 	})
+
+	t.Run("Multi-Step Decay Clears TotalWeight When Buckets Expire", func(t *testing.T) {
+		h, _ := NewDecayingHistogram(start, halfLife, "1.0")
+		h.Add(5.0, start)
+		h.Add(8.0, start)
+
+		// Each 11-half-life step has decayFactor = 2^-11 ~= 4.88e-4 (>= 1e-6),
+		// so decay() takes the per-bucket path rather than the fast reset.
+		// After two steps, each bucket decays to 2^-22 ~= 2.38e-7 (< 1e-6)
+		// and is deleted; TotalWeight must also become 0 rather than keeping
+		// phantom weight.
+		t1 := start.Add(11 * halfLife)
+		h.Percentile(0.5, t1)
+		t2 := t1.Add(11 * halfLife)
+		if got := h.Percentile(0.5, t2); got != 0 {
+			t.Errorf("Percentile after multi-step bucket expiration = %v, want 0", got)
+		}
+		if len(h.Buckets) != 0 {
+			t.Errorf("Buckets = %v, want empty", h.Buckets)
+		}
+		if h.TotalWeight != 0 {
+			t.Errorf("TotalWeight = %g, want 0", h.TotalWeight)
+		}
+	})
+
+	t.Run("Partial Bucket Expiration Keeps TotalWeight Equal To Surviving Buckets", func(t *testing.T) {
+		h, _ := NewDecayingHistogram(start, halfLife, "1.0")
+		h.Add(1.5, start) // Bucket 1, weight 1.0 at T0
+
+		// Advance 11 half-lives and add a fresh sample in Bucket 5.
+		t1 := start.Add(11 * halfLife)
+		h.Add(5.5, t1) // Bucket 1 ~= 2^-11, Bucket 5 = 1.0
+
+		// Advance another 11 half-lives: Bucket 1 drops below 1e-6 and is
+		// pruned, while Bucket 5 survives with weight 2^-11.
+		t2 := t1.Add(11 * halfLife)
+		h.Percentile(0.5, t2)
+
+		wantWeight := math.Pow(0.5, 11)
+		if _, exists := h.Buckets[1]; exists {
+			t.Errorf("Bucket 1 should have been pruned, still has weight %g", h.Buckets[1])
+		}
+		if math.Abs(h.TotalWeight-wantWeight) > 1e-12 {
+			t.Errorf("TotalWeight = %g, want exact surviving weight %g", h.TotalWeight, wantWeight)
+		}
+	})
+
+	t.Run("Stale Past And Non-Finite Samples Are Ignored", func(t *testing.T) {
+		h, _ := NewDecayingHistogram(start, halfLife, "1.0")
+		tNow := start.Add(30 * halfLife)
+		h.Add(2.5, tNow)
+
+		h.Add(9.5, start) // 30 half-lives in the past: weight < 1e-6
+		h.Add(math.NaN(), tNow)
+		h.Add(math.Inf(1), tNow)
+		h.Add(math.Inf(-1), tNow)
+
+		if len(h.Buckets) != 1 {
+			t.Errorf("len(Buckets) = %d, want 1; Buckets = %v", len(h.Buckets), h.Buckets)
+		}
+		if h.TotalWeight != 1.0 {
+			t.Errorf("TotalWeight = %g, want 1.0", h.TotalWeight)
+		}
+	})
+}
+
+func TestDecayingHistogram_Merge(t *testing.T) {
+	start := time.Unix(1000, 0)
+	halfLife := 10 * time.Second
+
+	t.Run("Merges Histograms Across Different Reference Times", func(t *testing.T) {
+		older, _ := NewDecayingHistogram(time.Time{}, halfLife, "1.0")
+		older.Add(1.5, start) // Bucket 1, weight 1.0 at T0
+
+		newer, _ := NewDecayingHistogram(time.Time{}, halfLife, "1.0")
+		t1 := start.Add(halfLife)
+		newer.Add(5.5, t1) // Bucket 5, weight 1.0 at T0 + 1 HL
+
+		merged, _ := NewDecayingHistogram(time.Time{}, halfLife, "1.0")
+		merged.Merge(older)
+		merged.Merge(newer)
+
+		if !merged.ReferenceTime.Equal(t1) {
+			t.Errorf("ReferenceTime = %v, want %v", merged.ReferenceTime, t1)
+		}
+		if math.Abs(merged.TotalWeight-1.5) > 1e-9 {
+			t.Errorf("TotalWeight = %g, want 1.5", merged.TotalWeight)
+		}
+		// P50 (target 0.75): Bucket 1 has 0.5 < 0.75, so falls in Bucket 5 -> 6.0.
+		if got := merged.Percentile(0.5, t1); got != 6.0 {
+			t.Errorf("P50 = %v, want 6.0", got)
+		}
+	})
+
+	t.Run("Ignores Nil Empty And Deeply Stale Histograms", func(t *testing.T) {
+		h, _ := NewDecayingHistogram(start, halfLife, "1.0")
+		tNow := start.Add(30 * halfLife)
+		h.Add(3.5, tNow)
+
+		emptyFuture, _ := NewDecayingHistogram(tNow.Add(10*halfLife), halfLife, "1.0")
+		stale, _ := NewDecayingHistogram(start, halfLife, "1.0")
+		stale.Add(9.5, start)
+
+		h.Merge(nil)
+		h.Merge(emptyFuture)
+		h.Merge(stale)
+
+		if !h.ReferenceTime.Equal(tNow) {
+			t.Errorf("ReferenceTime = %v, want %v", h.ReferenceTime, tNow)
+		}
+		if len(h.Buckets) != 1 || h.TotalWeight != 1.0 {
+			t.Errorf("Buckets = %v, TotalWeight = %g; want single bucket with weight 1.0", h.Buckets, h.TotalWeight)
+		}
+	})
 }
