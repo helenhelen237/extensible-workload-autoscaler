@@ -570,3 +570,70 @@ func TestIngest_InvalidDecayingDistributionBucketSize(t *testing.T) {
 		}
 	}
 }
+
+func TestIngest_GlobalDecayingDistributionCounterRateMultiPod(t *testing.T) {
+	// Mirrors samples/manifests/distribution-decaying.yaml: a global decaying
+	// distribution with rate: 0s over per-pod/per-container CPU counters.
+	policy := pb.Policy_builder{Metrics: []*pb.MetricDefinition{pb.MetricDefinition_builder{
+		Name: new("cpu_distribution"),
+		DecayingDistribution: pb.DecayingDistribution_builder{
+			HalfLife:   durationpb.New(24 * time.Hour),
+			BucketSize: new("0.1"),
+			Percentile: new("p90"),
+			Rate:       durationpb.New(0),
+		}.Build(),
+	}.Build()}}.Build()
+
+	ms := NewMetricStore()
+	workload := readyPods("pod-a", "pod-b")
+
+	counterSample := func(ts time.Time, v float64) *pb.MetricSample {
+		return pb.MetricSample_builder{
+			Name:         new("cpu_distribution"),
+			ResourceName: new("cpu"),
+			Counter:      new(v),
+			Timestamp:    timestamppb.New(ts),
+		}.Build()
+	}
+
+	// Scrape 1 at t0: pod-a has a large cumulative counter (500s), pod-b just
+	// started (10s).
+	if err := ms.IngestMetrics(policy, workload, []*pb.MetricBatch{
+		pb.MetricBatch_builder{PodName: new("pod-a"), ContainerName: new("app"), Samples: []*pb.MetricSample{counterSample(t0, 500)}}.Build(),
+		pb.MetricBatch_builder{PodName: new("pod-b"), ContainerName: new("app"), Samples: []*pb.MetricSample{counterSample(t0, 10)}}.Build(),
+	}, t0); err != nil {
+		t.Fatalf("IngestMetrics(t0) = %v", err)
+	}
+	if cm := ms.calculate(policy.GetMetrics(), workload, t0); len(cm.GetValues()) != 0 {
+		t.Fatalf("calculate(t0) = %v, want no value before second counter sample", cm.GetValues())
+	}
+
+	// Scrape 2 at t0+10s: pod-a used 0.4 cores (+4s), pod-b used 0.2 cores (+2s).
+	if err := ms.IngestMetrics(policy, workload, []*pb.MetricBatch{
+		pb.MetricBatch_builder{PodName: new("pod-a"), ContainerName: new("app"), Samples: []*pb.MetricSample{counterSample(at(10*time.Second), 504)}}.Build(),
+		pb.MetricBatch_builder{PodName: new("pod-b"), ContainerName: new("app"), Samples: []*pb.MetricSample{counterSample(at(10*time.Second), 12)}}.Build(),
+	}, at(10*time.Second)); err != nil {
+		t.Fatalf("IngestMetrics(t0+10s) = %v", err)
+	}
+
+	cm := ms.calculate(policy.GetMetrics(), workload, at(10*time.Second))
+	// Rates are 0.2 (bucket [0.2, 0.3)) and 0.4 (bucket [0.4, 0.5)), so p90 = 0.5.
+	if got, want := cm.GetValues()["cpu_distribution"], 0.5; !cmp.Equal(got, want, cmpopts.EquateApprox(0, 1e-6)) {
+		t.Errorf("cpu_distribution = %v, want %v", got, want)
+	}
+
+	// After pod-a disappears and its series is garbage-collected past
+	// seriesRetention, its historical rate observation stays in the global
+	// decaying histogram while pod-b continues reporting lower usage (0.1 cores).
+	workloadOnlyB := readyPods("pod-b")
+	tLater := at(15 * time.Minute)
+	if err := ms.IngestMetrics(policy, workloadOnlyB, []*pb.MetricBatch{
+		pb.MetricBatch_builder{PodName: new("pod-b"), ContainerName: new("app"), Samples: []*pb.MetricSample{counterSample(tLater, 101.4)}}.Build(),
+	}, tLater); err != nil {
+		t.Fatalf("IngestMetrics(tLater) = %v", err)
+	}
+	cm = ms.calculate(policy.GetMetrics(), workloadOnlyB, tLater)
+	if got, want := cm.GetValues()["cpu_distribution"], 0.5; !cmp.Equal(got, want, cmpopts.EquateApprox(0, 1e-6)) {
+		t.Errorf("cpu_distribution after pod-a GC = %v, want %v", got, want)
+	}
+}
