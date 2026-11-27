@@ -43,8 +43,9 @@ type CoreNodeMetricsProvider struct {
 	kubeletClient *http.Client
 	token         string
 
-	// kubelet exports the metrics scraped from the kubelet.
-	kubelet *kubeletExporter
+	// kubeletExporters holds the exporter of each kubelet endpoint, keyed by
+	// URL. Each is used by the goroutine of its endpoint only.
+	kubeletExporters map[string]*kubeletExporter
 }
 
 func NewCoreNodeMetricsProvider(kubeClient kubernetes.Interface, providerLister listers.MetricProviderClassLister, serverAddress, nodeName, hostIP, clusterName string) (*CoreNodeMetricsProvider, error) {
@@ -72,28 +73,38 @@ func NewCoreNodeMetricsProvider(kubeClient kubernetes.Interface, providerLister 
 				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 			},
 		},
-		kubelet: newKubeletExporter(),
+		kubeletExporters: make(map[string]*kubeletExporter),
 	}, nil
 }
 
-// Run scrapes and sends the metrics every 5 s until the context is cancelled.
+// reconcileInterval is the interval between two reconciliations of the
+// scrape targets with the policies and their pods.
+const reconcileInterval = 5 * time.Second
+
+// Run runs one goroutine per scrape target, and reconciles the scrape targets
+// with the policies and their pods every reconcileInterval, until the context
+// is cancelled.
 func (a *CoreNodeMetricsProvider) Run(ctx context.Context) error {
 	defer a.grpcConn.Close()
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
+	scrapers := newScraperSet(scrapeInterval, a.scrapeAndSend)
+	defer scrapers.stop()
 
+	ticker := time.NewTicker(reconcileInterval)
+	defer ticker.Stop()
 	for {
+		a.reconcile(ctx, scrapers)
 		select {
-		case <-ticker.C:
-			a.scrapeAndSend(ctx)
 		case <-ctx.Done():
 			return nil
+		case <-ticker.C:
 		}
 	}
 }
 
-func (a *CoreNodeMetricsProvider) scrapeAndSend(ctx context.Context) {
-	slog.Info("Scrape cycle starting...")
+// reconcile computes the scrape targets of the policies and their pods on this
+// node, and makes the scrapers match them.
+func (a *CoreNodeMetricsProvider) reconcile(ctx context.Context, scrapers *scraperSet) {
+	slog.Debug("Reconciling scrape targets")
 
 	// 1. Get Policies from Server
 	listCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
@@ -106,7 +117,7 @@ func (a *CoreNodeMetricsProvider) scrapeAndSend(ctx context.Context) {
 		return
 	}
 
-	slog.Info("Found policies", "count", len(pols))
+	slog.Debug("Found policies", "count", len(pols))
 
 	// 2. Group the metrics of the providers this binary implements by policy.
 	var policies []*groupedPolicy
@@ -137,25 +148,8 @@ func (a *CoreNodeMetricsProvider) scrapeAndSend(ctx context.Context) {
 		pol.Pods = a.listPods(ctx, pol)
 	}
 
-	// 4. Scrape each endpoint once, for all the metrics that read it.
-	batches := a.scrapeTargets(ctx, a.buildTargets(policies))
-
-	// 5. Send the batches of each policy.
-	for _, pol := range policies {
-		if len(batches[pol]) == 0 {
-			continue
-		}
-		a.sendBatch(ctx, pb.IngestMetricsRequest_builder{
-			Timestamp: timestamppb.Now(),
-			PolicyMetrics: []*pb.PolicyMetricBatch{
-				pb.PolicyMetricBatch_builder{
-					Namespace: new(pol.Namespace),
-					Name:      new(pol.Name),
-					Batches:   batches[pol],
-				}.Build(),
-			},
-		}.Build())
-	}
+	// 4. Run one goroutine per endpoint.
+	scrapers.sync(ctx, a.buildTargets(policies))
 }
 
 type groupedPolicy struct {
@@ -216,6 +210,7 @@ type metricUse struct {
 // policies, is a single target.
 func (a *CoreNodeMetricsProvider) buildTargets(policies []*groupedPolicy) []*target {
 	var targets []*target
+	kubeletURLs := make(map[string]bool)
 	byURL := make(map[string]*target)
 	addUse := func(url string, newTarget func() *target, use metricUse) {
 		t, ok := byURL[url]
@@ -241,8 +236,9 @@ func (a *CoreNodeMetricsProvider) buildTargets(policies []*groupedPolicy) []*tar
 					continue
 				}
 				url := endpointURL("https", a.hostIP, param(m, class, "port"), param(m, class, "path"), "10250", "/metrics/resource")
+				kubeletURLs[url] = true
 				addUse(url, func() *target {
-					return &target{client: a.kubeletClient, token: a.token, exporter: a.kubelet}
+					return &target{client: a.kubeletClient, token: a.token, exporter: a.kubeletExporter(url)}
 				}, metricUse{policy: pol, def: m, class: class, pods: pol.Pods})
 
 			case "Prometheus":
@@ -265,27 +261,67 @@ func (a *CoreNodeMetricsProvider) buildTargets(policies []*groupedPolicy) []*tar
 			}
 		}
 	}
+	// Forget the exporters (and CPU samples) of the kubelet endpoints no
+	// longer scraped.
+	for url := range a.kubeletExporters {
+		if !kubeletURLs[url] {
+			delete(a.kubeletExporters, url)
+		}
+	}
 	return targets
 }
 
-// scrapeTargets scrapes each target once and exports the metrics that read
-// it, returning the batches of each policy.
-func (a *CoreNodeMetricsProvider) scrapeTargets(ctx context.Context, targets []*target) map[*groupedPolicy][]*pb.MetricBatch {
-	batches := make(map[*groupedPolicy][]*pb.MetricBatch)
-	for _, t := range targets {
-		families, err := scrapeEndpoint(ctx, t.client, t.url, t.token)
-		if err != nil {
+// kubeletExporter returns the exporter of a kubelet endpoint, creating it if
+// needed.
+func (a *CoreNodeMetricsProvider) kubeletExporter(url string) *kubeletExporter {
+	e, ok := a.kubeletExporters[url]
+	if !ok {
+		e = newKubeletExporter()
+		a.kubeletExporters[url] = e
+	}
+	return e
+}
+
+// scrapeTarget scrapes the endpoint of a target once and exports every metric
+// that reads it, returning the batches of each policy.
+func scrapeTarget(ctx context.Context, t *target) map[*groupedPolicy][]*pb.MetricBatch {
+	families, err := scrapeEndpoint(ctx, t.client, t.url, t.token)
+	if err != nil {
+		if ctx.Err() == nil {
 			slog.Error("Failed to scrape endpoint", "url", t.url, "error", err)
-			continue
 		}
-		for _, u := range t.uses {
-			for _, pod := range u.pods {
-				batches[u.policy] = append(batches[u.policy], t.exporter.Export(families, pod, u.def, u.class)...)
-			}
+		return nil
+	}
+	batches := make(map[*groupedPolicy][]*pb.MetricBatch)
+	for _, u := range t.uses {
+		for _, pod := range u.pods {
+			batches[u.policy] = append(batches[u.policy], t.exporter.Export(families, pod, u.def, u.class)...)
 		}
 	}
-	a.kubelet.forgetUnseen()
+	if e, ok := t.exporter.(*kubeletExporter); ok {
+		e.forgetUnseen()
+	}
 	return batches
+}
+
+// scrapeAndSend scrapes the endpoint of a target once and sends the batches
+// of each policy.
+func (a *CoreNodeMetricsProvider) scrapeAndSend(ctx context.Context, t *target) {
+	for pol, batches := range scrapeTarget(ctx, t) {
+		if len(batches) == 0 {
+			continue
+		}
+		a.sendBatch(ctx, pb.IngestMetricsRequest_builder{
+			Timestamp: timestamppb.Now(),
+			PolicyMetrics: []*pb.PolicyMetricBatch{
+				pb.PolicyMetricBatch_builder{
+					Namespace: new(pol.Namespace),
+					Name:      new(pol.Name),
+					Batches:   batches,
+				}.Build(),
+			},
+		}.Build())
+	}
 }
 
 func (a *CoreNodeMetricsProvider) sendBatch(ctx context.Context, pbReq *pb.IngestMetricsRequest) {
@@ -300,7 +336,7 @@ func (a *CoreNodeMetricsProvider) sendBatch(ctx context.Context, pbReq *pb.Inges
 		slog.Error("Failed to send batch", "error", err)
 		return
 	}
-	slog.Info("Batch sent", "success", resp.GetSuccess())
+	slog.Debug("Batch sent", "success", resp.GetSuccess())
 }
 
 // shouldScrape reports whether the metrics of a pod can be scraped: only a

@@ -55,7 +55,7 @@ func TestBuildTargets(t *testing.T) {
 			testClass("kubelet", "Kubelet", map[string]string{"port": "10250", "path": "/metrics/resource"}),
 			testClass("prometheus", "Prometheus", map[string]string{"port": "8080", "path": "/metrics"}),
 		),
-		kubelet: newKubeletExporter(),
+		kubeletExporters: make(map[string]*kubeletExporter),
 	}
 
 	pod1, pod2 := testPod("pod-1", "1.1.1.1"), testPod("pod-2", "2.2.2.2")
@@ -108,16 +108,16 @@ a 1
 b 2
 `}}
 	p := &CoreNodeMetricsProvider{
-		httpClient:     &http.Client{Transport: transport},
-		providerLister: testClassLister(t, testClass("prometheus", "Prometheus", nil)),
-		kubelet:        newKubeletExporter(),
+		httpClient:       &http.Client{Transport: transport},
+		providerLister:   testClassLister(t, testClass("prometheus", "Prometheus", nil)),
+		kubeletExporters: make(map[string]*kubeletExporter),
 	}
 	pol := &groupedPolicy{Name: "a", Pods: []corev1.Pod{testPod("pod-1", "1.1.1.1")}, Metrics: []*pb.MetricDefinition{
 		metricDef("metric-a", "prometheus", map[string]string{"metric": "a"}),
 		metricDef("metric-b", "prometheus", map[string]string{"metric": "b"}),
 	}}
 
-	batches := p.scrapeTargets(context.Background(), p.buildTargets([]*groupedPolicy{pol}))[pol]
+	batches := scrapeAll(p.buildTargets([]*groupedPolicy{pol}))[pol]
 
 	if n := transport.requests.Load(); n != 1 {
 		t.Errorf("endpoint scraped %d times, want 1", n)
@@ -132,4 +132,16 @@ b 2
 	if diff := cmp.Diff([]string{"metric-a", "metric-b"}, names); diff != "" {
 		t.Errorf("exported samples mismatch (-want +got):\n%s", diff)
 	}
+}
+
+// scrapeAll scrapes each target once, as their goroutines do on a tick, and
+// returns the batches of each policy.
+func scrapeAll(targets []*target) map[*groupedPolicy][]*pb.MetricBatch {
+	all := make(map[*groupedPolicy][]*pb.MetricBatch)
+	for _, t := range targets {
+		for pol, b := range scrapeTarget(context.Background(), t) {
+			all[pol] = append(all[pol], b...)
+		}
+	}
+	return all
 }
