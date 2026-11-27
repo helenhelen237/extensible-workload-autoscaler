@@ -36,7 +36,7 @@ func (m *mockTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}, nil
 }
 
-func TestProcessPrometheusMetric(t *testing.T) {
+func TestPrometheusExport(t *testing.T) {
 
 	pod := corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: "pod-1", Namespace: "default"},
@@ -332,25 +332,20 @@ requested 456
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			provider := &CoreNodeMetricsProvider{
-				httpClient: &http.Client{
-					Transport: &mockTransport{body: tc.mockBody, verify: tc.verify},
-				},
-			}
-
-			got := provider.processPrometheusMetric(pod, tc.def, tc.class)
+			client := &http.Client{Transport: &mockTransport{body: tc.mockBody, verify: tc.verify}}
+			got := exportPrometheus(t, client, pod, tc.def, tc.class)
 
 			if diff := cmp.Diff(tc.want, got, protocmp.Transform(), protocmp.IgnoreDefaultScalars()); diff != "" {
-				t.Errorf("processPrometheusMetric mismatch (-want +got):\n%s", diff)
+				t.Errorf("Prometheus export mismatch (-want +got):\n%s", diff)
 			}
 		})
 	}
 }
 
-// TestProcessPrometheusMetricNoScrape checks the cases where nothing is
+// TestPrometheusNoScrape checks the cases where nothing is
 // exported: a pod without an IP isn't scraped, and a response other than
 // 200 OK isn't parsed.
-func TestProcessPrometheusMetricNoScrape(t *testing.T) {
+func TestPrometheusNoScrape(t *testing.T) {
 	def := pb.MetricDefinition_builder{
 		Name:     new("q_size"),
 		Provider: new("prometheus"),
@@ -370,19 +365,17 @@ func TestProcessPrometheusMetricNoScrape(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			scraped := false
-			provider := &CoreNodeMetricsProvider{
-				httpClient: &http.Client{Transport: &mockTransport{
-					body:   body,
-					status: tc.status,
-					verify: func(*http.Request) { scraped = true },
-				}},
-			}
+			client := &http.Client{Transport: &mockTransport{
+				body:   body,
+				status: tc.status,
+				verify: func(*http.Request) { scraped = true },
+			}}
 			pod := corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{Name: "pod-1", Namespace: "default"},
 				Status:     corev1.PodStatus{PodIP: tc.podIP},
 			}
-			if got := provider.processPrometheusMetric(pod, def, nil); got != nil {
-				t.Errorf("processPrometheusMetric() = %v, want nil", got)
+			if got := exportPrometheus(t, client, pod, def, nil); got != nil {
+				t.Errorf("exported %v, want nothing", got)
 			}
 			if tc.podIP == "" && scraped {
 				t.Errorf("a pod without an IP was scraped")
@@ -407,4 +400,21 @@ func TestEndpointURL(t *testing.T) {
 			}
 		})
 	}
+}
+
+// exportPrometheus scrapes the Prometheus endpoint of a pod for a metric of
+// the "prometheus" class and exports it, as a scrape cycle does.
+func exportPrometheus(t *testing.T, client *http.Client, pod corev1.Pod, def *pb.MetricDefinition, class *xasv1.MetricProviderClass) []*pb.MetricBatch {
+	t.Helper()
+	c := testClass("prometheus", "Prometheus", nil)
+	if class != nil {
+		c.Spec.Config = class.Spec.Config
+	}
+	p := &CoreNodeMetricsProvider{
+		httpClient:     client,
+		providerLister: testClassLister(t, c),
+		kubelet:        newKubeletExporter(),
+	}
+	pol := &groupedPolicy{Pods: []corev1.Pod{pod}, Metrics: []*pb.MetricDefinition{def}}
+	return p.scrapeTargets(p.buildTargets([]*groupedPolicy{pol}))[pol]
 }

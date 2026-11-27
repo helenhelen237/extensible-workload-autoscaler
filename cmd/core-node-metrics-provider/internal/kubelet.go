@@ -1,9 +1,7 @@
 package internal
 
 import (
-	"errors"
 	"fmt"
-	"log/slog"
 	"sort"
 	"time"
 
@@ -23,25 +21,6 @@ type KubeletContainerMetrics struct {
 	CPUUsageSeconds *float64
 	MemoryBytes     *float64
 	Timestamp       *int64 // Milliseconds
-}
-
-func (a *CoreNodeMetricsProvider) scrapeKubelet(port, path string) map[string]*dto.MetricFamily {
-	if a.hostIP == "" {
-		return nil
-	}
-
-	url := endpointURL("https", a.hostIP, port, path, "10250", "/metrics/resource")
-	families, err := scrapeEndpoint(a.kubeletClient, url, a.token)
-	var statusErr *unexpectedStatusError
-	if errors.As(err, &statusErr) {
-		slog.Warn("Kubelet returned error", "statusCode", statusErr.statusCode)
-		return nil
-	}
-	if err != nil {
-		slog.Error("Failed to scrape kubelet", "error", err)
-		return nil
-	}
-	return families
 }
 
 // kubeletExporter exports the CPU and memory usage of containers scraped

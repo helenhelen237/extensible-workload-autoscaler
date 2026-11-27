@@ -2,7 +2,6 @@ package internal
 
 import (
 	"fmt"
-	"log/slog"
 
 	dto "github.com/prometheus/client_model/go"
 	corev1 "k8s.io/api/core/v1"
@@ -110,27 +109,6 @@ func familySamples(families map[string]*dto.MetricFamily, whitelist []string) []
 		}
 	}
 	return samples
-}
-
-func (a *CoreNodeMetricsProvider) processPrometheusMetric(pod corev1.Pod, m *pb.MetricDefinition, class *xasv1.MetricProviderClass) []*pb.MetricBatch {
-	getParam := func(key string) string { return param(m, class, key) }
-
-	metricName := getParam("metric")
-	if metricName == "" {
-		return nil
-	}
-	ip := pod.Status.PodIP
-	if ip == "" {
-		// The pod has no IP yet: there is nothing to scrape.
-		return nil
-	}
-	url := endpointURL("http", ip, getParam("port"), getParam("path"), "8080", "/metrics")
-	families, err := scrapeEndpoint(a.httpClient, url, "")
-	if err != nil {
-		slog.Error("Failed to scrape prometheus metric from pod", "pod", pod.Name, "url", url, "metric", metricName, "error", err)
-		return nil
-	}
-	return prometheusExporter{}.Export(families, pod, m, class)
 }
 
 // prometheusExporter exports the metrics scraped from the Prometheus endpoint

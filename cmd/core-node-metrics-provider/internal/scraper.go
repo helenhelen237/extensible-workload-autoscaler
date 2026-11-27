@@ -7,10 +7,8 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
-	"strings"
 	"time"
 
-	dto "github.com/prometheus/client_model/go"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -110,10 +108,8 @@ func (a *CoreNodeMetricsProvider) scrapeAndSend() {
 
 	slog.Info("Found policies", "count", len(pols))
 
-	// 2. Discover needed Kubelet endpoints and group metrics by Policy
-	kubeletConfigs := make(map[string]bool) // key: "port|path"
-	policies := make(map[string]*groupedPolicy)
-
+	// 2. Group the metrics of the providers this binary implements by policy.
+	var policies []*groupedPolicy
 	for _, pol := range pols {
 		var relevantMetrics []*pb.MetricDefinition
 		for _, m := range policy.MetricDefinitions(pol) {
@@ -122,43 +118,44 @@ func (a *CoreNodeMetricsProvider) scrapeAndSend() {
 				slog.Warn("MetricProviderClass not found for metric", "class", m.GetProvider(), "metric", m.GetName())
 				continue
 			}
-
-			if class.Spec.Type == "Kubelet" {
-				relevantMetrics = append(relevantMetrics, m)
-				// Record needed Kubelet endpoint
-				kubeletConfigs[kubeletConfigKey(m, class)] = true
-			} else if class.Spec.Type == "Prometheus" {
+			if class.Spec.Type == "Kubelet" || class.Spec.Type == "Prometheus" {
 				relevantMetrics = append(relevantMetrics, m)
 			}
 		}
-
-		if len(relevantMetrics) > 0 {
-			key := fmt.Sprintf("%s/%s", pol.GetId().GetNamespace(), pol.GetId().GetName())
-			policies[key] = &groupedPolicy{
+		if len(relevantMetrics) > 0 && pol.GetSelector() != "" {
+			policies = append(policies, &groupedPolicy{
 				Namespace: pol.GetId().GetNamespace(),
 				Name:      pol.GetId().GetName(),
 				Selector:  pol.GetSelector(),
 				Metrics:   relevantMetrics,
-			}
+			})
 		}
 	}
 
-	// 3. Scrape all required Kubelet endpoints
-	kubeletFamilies := make(map[string]map[string]*dto.MetricFamily)
-	for cfg := range kubeletConfigs {
-		parts := strings.Split(cfg, "|")
-		families := a.scrapeKubelet(parts[0], parts[1])
-		if families != nil {
-			kubeletFamilies[cfg] = families
-		}
-	}
-
-	// 4. Process each policy
+	// 3. List the pods of each policy on this node.
 	for _, pol := range policies {
-		a.processGroupedPolicy(pol, kubeletFamilies)
+		pol.Pods = a.listPods(pol)
 	}
 
-	a.kubelet.forgetUnseen()
+	// 4. Scrape each endpoint once, for all the metrics that read it.
+	batches := a.scrapeTargets(a.buildTargets(policies))
+
+	// 5. Send the batches of each policy.
+	for _, pol := range policies {
+		if len(batches[pol]) == 0 {
+			continue
+		}
+		a.sendBatch(pb.IngestMetricsRequest_builder{
+			Timestamp: timestamppb.Now(),
+			PolicyMetrics: []*pb.PolicyMetricBatch{
+				pb.PolicyMetricBatch_builder{
+					Namespace: new(pol.Namespace),
+					Name:      new(pol.Name),
+					Batches:   batches[pol],
+				}.Build(),
+			},
+		}.Build())
+	}
 }
 
 type groupedPolicy struct {
@@ -166,78 +163,129 @@ type groupedPolicy struct {
 	Name      string
 	Selector  string
 	Metrics   []*pb.MetricDefinition
+	// Pods are the scrapable pods of the policy on this node.
+	Pods []corev1.Pod
 }
 
-func (a *CoreNodeMetricsProvider) processGroupedPolicy(policy *groupedPolicy, kubeletFamilies map[string]map[string]*dto.MetricFamily) {
-	if policy.Selector == "" {
-		return
-	}
-
+// listPods returns the scrapable pods of a policy on this node.
+func (a *CoreNodeMetricsProvider) listPods(pol *groupedPolicy) []corev1.Pod {
 	opts := metav1.ListOptions{
-		LabelSelector: policy.Selector,
+		LabelSelector: pol.Selector,
 	}
 	if a.nodeName != "" {
 		opts.FieldSelector = fmt.Sprintf("spec.nodeName=%s", a.nodeName)
 	}
 
-	pods, err := a.kubeClient.CoreV1().Pods(policy.Namespace).List(context.TODO(), opts)
+	pods, err := a.kubeClient.CoreV1().Pods(pol.Namespace).List(context.TODO(), opts)
 	if err != nil {
 		slog.Error("Error listing pods", "error", err)
-		return
+		return nil
 	}
-	slog.Debug("Found pods for policy", "policy", policy.Name, "count", len(pods.Items))
+	slog.Debug("Found pods for policy", "policy", pol.Name, "count", len(pods.Items))
 
-	var podMetrics []*pb.MetricBatch
-
+	var scrapable []corev1.Pod
 	for _, pod := range pods.Items {
-		if !shouldScrape(&pod) {
-			continue
+		if shouldScrape(&pod) {
+			scrapable = append(scrapable, pod)
 		}
+	}
+	return scrapable
+}
 
-		for _, m := range policy.Metrics {
+// target is an endpoint to scrape, along with the metrics that read it.
+type target struct {
+	url      string
+	client   *http.Client
+	token    string // Bearer token, if the endpoint requires one.
+	exporter Exporter
+	uses     []metricUse
+}
+
+// metricUse is a metric of a policy that reads an endpoint, along with the
+// pods of the policy whose samples it reports.
+type metricUse struct {
+	policy *groupedPolicy
+	def    *pb.MetricDefinition
+	class  *xasv1.MetricProviderClass
+	pods   []corev1.Pod
+}
+
+// buildTargets returns the endpoints to scrape for the metrics of the
+// policies: the kubelet endpoint(s) of this node and the Prometheus endpoint
+// of each pod. An endpoint read by several metrics, of one or several
+// policies, is a single target.
+func (a *CoreNodeMetricsProvider) buildTargets(policies []*groupedPolicy) []*target {
+	var targets []*target
+	byURL := make(map[string]*target)
+	addUse := func(url string, newTarget func() *target, use metricUse) {
+		t, ok := byURL[url]
+		if !ok {
+			t = newTarget()
+			t.url = url
+			byURL[url] = t
+			targets = append(targets, t)
+		}
+		t.uses = append(t.uses, use)
+	}
+
+	for _, pol := range policies {
+		for _, m := range pol.Metrics {
 			class, err := a.providerLister.Get(m.GetProvider())
 			if err != nil {
 				continue
 			}
 
-			var batches []*pb.MetricBatch
-
 			switch class.Spec.Type {
 			case "Kubelet":
-				if families, ok := kubeletFamilies[kubeletConfigKey(m, class)]; ok {
-					batches = a.kubelet.Export(families, pod, m, class)
+				if a.hostIP == "" {
+					continue
 				}
+				url := endpointURL("https", a.hostIP, param(m, class, "port"), param(m, class, "path"), "10250", "/metrics/resource")
+				addUse(url, func() *target {
+					return &target{client: a.kubeletClient, token: a.token, exporter: a.kubelet}
+				}, metricUse{policy: pol, def: m, class: class, pods: pol.Pods})
+
 			case "Prometheus":
-				batches = a.processPrometheusMetric(pod, m, class)
+				if param(m, class, "metric") == "" {
+					continue
+				}
+				for _, pod := range pol.Pods {
+					if pod.Status.PodIP == "" {
+						// The pod has no IP yet: there is nothing to scrape.
+						continue
+					}
+					url := endpointURL("http", pod.Status.PodIP, param(m, class, "port"), param(m, class, "path"), "8080", "/metrics")
+					addUse(url, func() *target {
+						return &target{client: a.httpClient, exporter: prometheusExporter{}}
+					}, metricUse{policy: pol, def: m, class: class, pods: []corev1.Pod{pod}})
+				}
+
 			default:
 				slog.Warn("Unknown provider type for metric", "type", class.Spec.Type, "metric", m.GetName())
 			}
+		}
+	}
+	return targets
+}
 
-			if len(batches) > 0 {
-				podMetrics = append(podMetrics, batches...)
+// scrapeTargets scrapes each target once and exports the metrics that read
+// it, returning the batches of each policy.
+func (a *CoreNodeMetricsProvider) scrapeTargets(targets []*target) map[*groupedPolicy][]*pb.MetricBatch {
+	batches := make(map[*groupedPolicy][]*pb.MetricBatch)
+	for _, t := range targets {
+		families, err := scrapeEndpoint(t.client, t.url, t.token)
+		if err != nil {
+			slog.Error("Failed to scrape endpoint", "url", t.url, "error", err)
+			continue
+		}
+		for _, u := range t.uses {
+			for _, pod := range u.pods {
+				batches[u.policy] = append(batches[u.policy], t.exporter.Export(families, pod, u.def, u.class)...)
 			}
 		}
 	}
-
-	if len(podMetrics) > 0 {
-		req := pb.IngestMetricsRequest_builder{
-			Timestamp: timestamppb.Now(),
-			PolicyMetrics: []*pb.PolicyMetricBatch{
-				pb.PolicyMetricBatch_builder{
-					Namespace: new(policy.Namespace),
-					Name:      new(policy.Name),
-					Batches:   podMetrics,
-				}.Build(),
-			},
-		}.Build()
-		a.sendBatch(req)
-	}
-}
-
-// kubeletConfigKey returns the "port|path" key of the kubelet endpoint read by
-// a metric.
-func kubeletConfigKey(m *pb.MetricDefinition, class *xasv1.MetricProviderClass) string {
-	return fmt.Sprintf("%s|%s", param(m, class, "port"), param(m, class, "path"))
+	a.kubelet.forgetUnseen()
+	return batches
 }
 
 func (a *CoreNodeMetricsProvider) sendBatch(pbReq *pb.IngestMetricsRequest) {
