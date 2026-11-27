@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/http"
@@ -34,8 +35,8 @@ func (e *unexpectedStatusError) Error() string {
 // scrapeEndpoint fetches the metrics exposed at url and parses them, in the
 // Prometheus text format. The token, if any, is sent as a Bearer token. A
 // response other than 200 OK is an *unexpectedStatusError.
-func scrapeEndpoint(client *http.Client, url, token string) (map[string]*dto.MetricFamily, error) {
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+func scrapeEndpoint(ctx context.Context, client *http.Client, url, token string) (map[string]*dto.MetricFamily, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}

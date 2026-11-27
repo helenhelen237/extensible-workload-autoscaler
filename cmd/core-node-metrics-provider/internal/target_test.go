@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"context"
 	"net/http"
 	"sort"
 	"sync/atomic"
@@ -116,7 +117,7 @@ b 2
 		metricDef("metric-b", "prometheus", map[string]string{"metric": "b"}),
 	}}
 
-	batches := p.scrapeTargets(p.buildTargets([]*groupedPolicy{pol}))[pol]
+	batches := p.scrapeTargets(context.Background(), p.buildTargets([]*groupedPolicy{pol}))[pol]
 
 	if n := transport.requests.Load(); n != 1 {
 		t.Errorf("endpoint scraped %d times, want 1", n)

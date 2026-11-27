@@ -47,13 +47,12 @@ type CoreNodeMetricsProvider struct {
 	kubelet *kubeletExporter
 }
 
-func NewCoreNodeMetricsProvider(kubeClient kubernetes.Interface, providerLister listers.MetricProviderClassLister, serverAddress, nodeName, hostIP, clusterName string) *CoreNodeMetricsProvider {
+func NewCoreNodeMetricsProvider(kubeClient kubernetes.Interface, providerLister listers.MetricProviderClassLister, serverAddress, nodeName, hostIP, clusterName string) (*CoreNodeMetricsProvider, error) {
 	token, _ := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/token")
 
 	conn, err := grpc.NewClient(serverAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		slog.Error("did not connect", "error", err)
-		os.Exit(1)
+		return nil, fmt.Errorf("creating the xAS Server client: %w", err)
 	}
 	client := pb.NewXASServerClient(conn)
 
@@ -74,10 +73,11 @@ func NewCoreNodeMetricsProvider(kubeClient kubernetes.Interface, providerLister 
 			},
 		},
 		kubelet: newKubeletExporter(),
-	}
+	}, nil
 }
 
-func (a *CoreNodeMetricsProvider) Run(ctx context.Context) {
+// Run scrapes and sends the metrics every 5 s until the context is cancelled.
+func (a *CoreNodeMetricsProvider) Run(ctx context.Context) error {
 	defer a.grpcConn.Close()
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
@@ -85,22 +85,22 @@ func (a *CoreNodeMetricsProvider) Run(ctx context.Context) {
 	for {
 		select {
 		case <-ticker.C:
-			a.scrapeAndSend()
+			a.scrapeAndSend(ctx)
 		case <-ctx.Done():
-			return
+			return nil
 		}
 	}
 }
 
-func (a *CoreNodeMetricsProvider) scrapeAndSend() {
+func (a *CoreNodeMetricsProvider) scrapeAndSend(ctx context.Context) {
 	slog.Info("Scrape cycle starting...")
 
 	// 1. Get Policies from Server
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	listCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
 	req := pb.ListPoliciesRequest_builder{ClusterName: new(a.clusterName)}.Build()
-	pols, err := xasgrpc.ListAllPages(ctx, req, a.grpcClient.ListPolicies, (*pb.ListPoliciesResponse).GetPolicies)
+	pols, err := xasgrpc.ListAllPages(listCtx, req, a.grpcClient.ListPolicies, (*pb.ListPoliciesResponse).GetPolicies)
 	if err != nil {
 		slog.Error("Error listing policies", "error", err)
 		return
@@ -134,18 +134,18 @@ func (a *CoreNodeMetricsProvider) scrapeAndSend() {
 
 	// 3. List the pods of each policy on this node.
 	for _, pol := range policies {
-		pol.Pods = a.listPods(pol)
+		pol.Pods = a.listPods(ctx, pol)
 	}
 
 	// 4. Scrape each endpoint once, for all the metrics that read it.
-	batches := a.scrapeTargets(a.buildTargets(policies))
+	batches := a.scrapeTargets(ctx, a.buildTargets(policies))
 
 	// 5. Send the batches of each policy.
 	for _, pol := range policies {
 		if len(batches[pol]) == 0 {
 			continue
 		}
-		a.sendBatch(pb.IngestMetricsRequest_builder{
+		a.sendBatch(ctx, pb.IngestMetricsRequest_builder{
 			Timestamp: timestamppb.Now(),
 			PolicyMetrics: []*pb.PolicyMetricBatch{
 				pb.PolicyMetricBatch_builder{
@@ -168,7 +168,7 @@ type groupedPolicy struct {
 }
 
 // listPods returns the scrapable pods of a policy on this node.
-func (a *CoreNodeMetricsProvider) listPods(pol *groupedPolicy) []corev1.Pod {
+func (a *CoreNodeMetricsProvider) listPods(ctx context.Context, pol *groupedPolicy) []corev1.Pod {
 	opts := metav1.ListOptions{
 		LabelSelector: pol.Selector,
 	}
@@ -176,7 +176,7 @@ func (a *CoreNodeMetricsProvider) listPods(pol *groupedPolicy) []corev1.Pod {
 		opts.FieldSelector = fmt.Sprintf("spec.nodeName=%s", a.nodeName)
 	}
 
-	pods, err := a.kubeClient.CoreV1().Pods(pol.Namespace).List(context.TODO(), opts)
+	pods, err := a.kubeClient.CoreV1().Pods(pol.Namespace).List(ctx, opts)
 	if err != nil {
 		slog.Error("Error listing pods", "error", err)
 		return nil
@@ -270,10 +270,10 @@ func (a *CoreNodeMetricsProvider) buildTargets(policies []*groupedPolicy) []*tar
 
 // scrapeTargets scrapes each target once and exports the metrics that read
 // it, returning the batches of each policy.
-func (a *CoreNodeMetricsProvider) scrapeTargets(targets []*target) map[*groupedPolicy][]*pb.MetricBatch {
+func (a *CoreNodeMetricsProvider) scrapeTargets(ctx context.Context, targets []*target) map[*groupedPolicy][]*pb.MetricBatch {
 	batches := make(map[*groupedPolicy][]*pb.MetricBatch)
 	for _, t := range targets {
-		families, err := scrapeEndpoint(t.client, t.url, t.token)
+		families, err := scrapeEndpoint(ctx, t.client, t.url, t.token)
 		if err != nil {
 			slog.Error("Failed to scrape endpoint", "url", t.url, "error", err)
 			continue
@@ -288,10 +288,10 @@ func (a *CoreNodeMetricsProvider) scrapeTargets(targets []*target) map[*groupedP
 	return batches
 }
 
-func (a *CoreNodeMetricsProvider) sendBatch(pbReq *pb.IngestMetricsRequest) {
+func (a *CoreNodeMetricsProvider) sendBatch(ctx context.Context, pbReq *pb.IngestMetricsRequest) {
 	pbReq.SetClusterName(a.clusterName)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
 	slog.Debug("Sending metrics batch", "policies", len(pbReq.GetPolicyMetrics()))

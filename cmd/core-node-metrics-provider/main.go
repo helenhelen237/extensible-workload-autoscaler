@@ -67,11 +67,23 @@ func main() {
 	factory := informers.NewSharedInformerFactory(xasClient, time.Second*30)
 	providerLister := factory.XAS().V1().MetricProviderClasses().Lister()
 
-	p := provider.NewCoreNodeMetricsProvider(kubeClient, providerLister, serverAddress, nodeName, hostIP, clusterName)
+	p, err := provider.NewCoreNodeMetricsProvider(kubeClient, providerLister, serverAddress, nodeName, hostIP, clusterName)
+	if err != nil {
+		slog.Error("Error creating the provider", "error", err)
+		os.Exit(1)
+	}
 
 	factory.Start(ctx.Done())
-	factory.WaitForCacheSync(ctx.Done())
+	for informer, synced := range factory.WaitForCacheSync(ctx.Done()) {
+		if !synced {
+			slog.Error("Failed to sync informer cache", "informer", informer.String())
+			os.Exit(1)
+		}
+	}
 
 	slog.Info("xAS Core Node Metrics Provider starting...")
-	p.Run(ctx)
+	if err := p.Run(ctx); err != nil {
+		slog.Error("Provider failed", "error", err)
+		os.Exit(1)
+	}
 }

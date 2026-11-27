@@ -2,6 +2,7 @@ package internal
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"net/http"
 	"testing"
@@ -416,5 +417,5 @@ func exportPrometheus(t *testing.T, client *http.Client, pod corev1.Pod, def *pb
 		kubelet:        newKubeletExporter(),
 	}
 	pol := &groupedPolicy{Pods: []corev1.Pod{pod}, Metrics: []*pb.MetricDefinition{def}}
-	return p.scrapeTargets(p.buildTargets([]*groupedPolicy{pol}))[pol]
+	return p.scrapeTargets(context.Background(), p.buildTargets([]*groupedPolicy{pol}))[pol]
 }
