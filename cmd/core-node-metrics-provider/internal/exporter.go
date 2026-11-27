@@ -2,7 +2,9 @@ package internal
 
 import (
 	"fmt"
+	"net"
 	"net/http"
+	"strings"
 
 	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
@@ -30,10 +32,9 @@ func (e *unexpectedStatusError) Error() string {
 }
 
 // scrapeEndpoint fetches the metrics exposed at url and parses them, in the
-// Prometheus text format. The token, if any, is sent as a Bearer token. If
-// requireOK is set, a response other than 200 OK is an
-// *unexpectedStatusError instead of being parsed.
-func scrapeEndpoint(client *http.Client, url, token string, requireOK bool) (map[string]*dto.MetricFamily, error) {
+// Prometheus text format. The token, if any, is sent as a Bearer token. A
+// response other than 200 OK is an *unexpectedStatusError.
+func scrapeEndpoint(client *http.Client, url, token string) (map[string]*dto.MetricFamily, error) {
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
@@ -48,10 +49,39 @@ func scrapeEndpoint(client *http.Client, url, token string, requireOK bool) (map
 	}
 	defer resp.Body.Close()
 
-	if requireOK && resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != http.StatusOK {
 		return nil, &unexpectedStatusError{statusCode: resp.StatusCode}
 	}
 
 	parser := expfmt.NewTextParser(model.LegacyValidation)
 	return parser.TextToMetricFamilies(resp.Body)
+}
+
+// endpointURL returns the URL of an endpoint of host, falling back to the
+// given default port and path.
+func endpointURL(scheme, host, port, path, defaultPort, defaultPath string) string {
+	if port == "" {
+		port = defaultPort
+	}
+	if path == "" {
+		path = defaultPath
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	return fmt.Sprintf("%s://%s%s", scheme, net.JoinHostPort(host, port), path)
+}
+
+// param returns the value of a parameter of a metric: the metric's own params
+// take precedence over the config of its MetricProviderClass.
+func param(m *pb.MetricDefinition, class *xasv1.MetricProviderClass, key string) string {
+	if val, ok := m.GetParams()[key]; ok {
+		return val
+	}
+	if class != nil {
+		if val, ok := class.Spec.Config[key]; ok {
+			return val
+		}
+	}
+	return ""
 }

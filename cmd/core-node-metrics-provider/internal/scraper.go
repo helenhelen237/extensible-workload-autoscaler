@@ -237,15 +237,7 @@ func (a *CoreNodeMetricsProvider) processGroupedPolicy(policy *groupedPolicy, ku
 // kubeletConfigKey returns the "port|path" key of the kubelet endpoint read by
 // a metric.
 func kubeletConfigKey(m *pb.MetricDefinition, class *xasv1.MetricProviderClass) string {
-	port := m.GetParams()["port"]
-	if port == "" {
-		port = class.Spec.Config["port"]
-	}
-	path := m.GetParams()["path"]
-	if path == "" {
-		path = class.Spec.Config["path"]
-	}
-	return fmt.Sprintf("%s|%s", port, path)
+	return fmt.Sprintf("%s|%s", param(m, class, "port"), param(m, class, "path"))
 }
 
 func (a *CoreNodeMetricsProvider) sendBatch(pbReq *pb.IngestMetricsRequest) {

@@ -17,6 +17,7 @@ import (
 
 type mockTransport struct {
 	body   string
+	status int // 200 if unset.
 	verify func(*http.Request)
 }
 
@@ -24,8 +25,12 @@ func (m *mockTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if m.verify != nil {
 		m.verify(req)
 	}
+	status := m.status
+	if status == 0 {
+		status = http.StatusOK
+	}
 	return &http.Response{
-		StatusCode: 200,
+		StatusCode: status,
 		Body:       io.NopCloser(bytes.NewBufferString(m.body)),
 		Header:     make(http.Header),
 	}, nil
@@ -337,6 +342,68 @@ requested 456
 
 			if diff := cmp.Diff(tc.want, got, protocmp.Transform(), protocmp.IgnoreDefaultScalars()); diff != "" {
 				t.Errorf("processPrometheusMetric mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+// TestProcessPrometheusMetricNoScrape checks the cases where nothing is
+// exported: a pod without an IP isn't scraped, and a response other than
+// 200 OK isn't parsed.
+func TestProcessPrometheusMetricNoScrape(t *testing.T) {
+	def := pb.MetricDefinition_builder{
+		Name:     new("q_size"),
+		Provider: new("prometheus"),
+		Params:   map[string]string{"metric": "queue_size"},
+	}.Build()
+	body := "# TYPE queue_size gauge\nqueue_size 42\n"
+
+	tests := []struct {
+		name   string
+		podIP  string
+		status int
+	}{
+		{name: "pod without an IP", podIP: "", status: http.StatusOK},
+		{name: "not found", podIP: "1.2.3.4", status: http.StatusNotFound},
+		{name: "server error", podIP: "1.2.3.4", status: http.StatusInternalServerError},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			scraped := false
+			provider := &CoreNodeMetricsProvider{
+				httpClient: &http.Client{Transport: &mockTransport{
+					body:   body,
+					status: tc.status,
+					verify: func(*http.Request) { scraped = true },
+				}},
+			}
+			pod := corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: "pod-1", Namespace: "default"},
+				Status:     corev1.PodStatus{PodIP: tc.podIP},
+			}
+			if got := provider.processPrometheusMetric(pod, def, nil); got != nil {
+				t.Errorf("processPrometheusMetric() = %v, want nil", got)
+			}
+			if tc.podIP == "" && scraped {
+				t.Errorf("a pod without an IP was scraped")
+			}
+		})
+	}
+}
+
+func TestEndpointURL(t *testing.T) {
+	tests := []struct {
+		name, host, port, path, want string
+	}{
+		{name: "defaults", host: "1.2.3.4", want: "http://1.2.3.4:8080/metrics"},
+		{name: "custom port and path", host: "1.2.3.4", port: "9090", path: "/custom", want: "http://1.2.3.4:9090/custom"},
+		{name: "path without leading slash", host: "1.2.3.4", path: "custom", want: "http://1.2.3.4:8080/custom"},
+		{name: "IPv6", host: "fd00::1", want: "http://[fd00::1]:8080/metrics"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := endpointURL("http", tc.host, tc.port, tc.path, "8080", "/metrics"); got != tc.want {
+				t.Errorf("endpointURL() = %q, want %q", got, tc.want)
 			}
 		})
 	}

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
-	"strings"
 	"time"
 
 	dto "github.com/prometheus/client_model/go"
@@ -31,19 +30,8 @@ func (a *CoreNodeMetricsProvider) scrapeKubelet(port, path string) map[string]*d
 		return nil
 	}
 
-	if port == "" {
-		port = "10250"
-	}
-	if path == "" {
-		path = "/metrics/resource"
-	}
-	if !strings.HasPrefix(path, "/") {
-		path = "/" + path
-	}
-
-	url := fmt.Sprintf("https://%s:%s%s", a.hostIP, port, path)
-
-	families, err := scrapeEndpoint(a.kubeletClient, url, a.token, true)
+	url := endpointURL("https", a.hostIP, port, path, "10250", "/metrics/resource")
+	families, err := scrapeEndpoint(a.kubeletClient, url, a.token)
 	var statusErr *unexpectedStatusError
 	if errors.As(err, &statusErr) {
 		slog.Warn("Kubelet returned error", "statusCode", statusErr.statusCode)
@@ -157,17 +145,7 @@ func getLabel(m *dto.Metric, name string) string {
 }
 
 func (e *kubeletExporter) processKubeletMetric(pod corev1.Pod, m *pb.MetricDefinition, podStatsMap map[string]*KubeletPodMetrics, class *xasv1.MetricProviderClass) []*pb.MetricBatch {
-	getParam := func(key string) string {
-		if val, ok := m.GetParams()[key]; ok {
-			return val
-		}
-		if class != nil {
-			if val, ok := class.Spec.Config[key]; ok {
-				return val
-			}
-		}
-		return ""
-	}
+	getParam := func(key string) string { return param(m, class, key) }
 
 	key := pod.Namespace + "/" + pod.Name
 	podStats, ok := podStatsMap[key]
